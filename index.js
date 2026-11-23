@@ -27,7 +27,7 @@
  */
 
 const MODULE_NAME = 'chat-autobackup';
-const EXT_VERSION = '1.2.0';
+const EXT_VERSION = '1.2.1';
 const IDB_NAME = 'chat-autobackup';
 const IDB_STORE = 'handles';
 const IDB_KEY_ROOT = 'backupRoot';
@@ -748,7 +748,7 @@ async function pickBackupRoot() {
     await idbSet(IDB_KEY_ROOT, handle);
     settings().rootName = handle.name || '已授权目录';
     saveSettings();
-    scheduleRefresh({ force: true });
+    refreshPanel({ forceRender: true });
     return handle;
 }
 
@@ -1476,14 +1476,17 @@ function switchTab(tabName) {
     for (const panel of root.querySelectorAll('.cab-tab-panel')) {
         panel.classList.toggle('is-active', panel.dataset.tab === tabName);
     }
-    if (isDrawerOpen()) {
-        refreshPanel({ onlyTab: tabName, forceRender: true });
-    } else {
-        panelDirty = true;
-    }
+    refreshPanel({ onlyTab: tabName, forceRender: true });
 }
 
-function isDrawerOpen() {
+function isPanelVisible() {
+    const content = document.getElementById('chat_autobackup_content');
+    if (!content) return false;
+    // 浏览器环境优先按真实盒模型可见性判断，兼容原生 slideToggle 及第三方设置弹窗
+    if (typeof content.getBoundingClientRect === 'function' && typeof window.getComputedStyle === 'function') {
+        const rect = content.getBoundingClientRect();
+        return rect.width > 0 || rect.height > 0;
+    }
     const drawer = document.querySelector('#chat_autobackup_container .inline-drawer');
     return Boolean(drawer?.classList.contains('open'));
 }
@@ -1528,8 +1531,25 @@ function buildPanel() {
         if (opened && panelDirty) {
             panelDirty = false;
             refreshPanel({ forceRender: true });
+            return;
         }
+        setTimeout(() => {
+            if (panelDirty && isPanelVisible()) {
+                panelDirty = false;
+                refreshPanel({ forceRender: true });
+            }
+        }, 50);
     });
+
+    if (typeof window.IntersectionObserver === 'function') {
+        const observer = new window.IntersectionObserver((entries) => {
+            if (entries.some((e) => e.isIntersecting) && panelDirty) {
+                panelDirty = false;
+                refreshPanel({ forceRender: true });
+            }
+        });
+        observer.observe(content);
+    }
 
     renderControls(content);
     refreshPanel({ forceRender: true });
@@ -2648,7 +2668,7 @@ function syncBusyUI(pending = null) {
 function scheduleRefresh({ force = false, tab = null } = {}) {
     if (!document.getElementById('chat_autobackup_container')) return;
     if (force) panelDirty = true;
-    if (!isDrawerOpen()) {
+    if (!isPanelVisible()) {
         try {
             syncHeaderDot(settings());
         } catch (e) {
@@ -2667,7 +2687,7 @@ function scheduleRefresh({ force = false, tab = null } = {}) {
     });
 }
 
-function refreshPanel({ onlyTab = null, forceRender = false } = {}) {
+function refreshPanel({ onlyTab = null, forceRender = true } = {}) {
     if (!document.getElementById('chat_autobackup_container')) return;
 
     let s;
@@ -2678,7 +2698,7 @@ function refreshPanel({ onlyTab = null, forceRender = false } = {}) {
     }
 
     syncHeaderDot(s);
-    if (!forceRender && !isDrawerOpen()) {
+    if (!forceRender && !isPanelVisible()) {
         panelDirty = true;
         return;
     }
