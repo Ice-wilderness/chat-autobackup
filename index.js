@@ -52,6 +52,12 @@ const DEFAULT_SETTINGS = Object.freeze({
 });
 
 let busy = false;
+const uiState = {
+    activeTab: 'overview',
+    searchQuery: '',
+    backingUp: false,
+    backfillProgress: null, // { current, total } | null
+};
 
 /* ------------------------------------------------------------------ *
  * 基础工具
@@ -252,6 +258,90 @@ function getCounter(key) {
     return s.counters[key];
 }
 
+/** 只读读取计数记录，避免仅仅刷新面板时污染 counters 字典 */
+function peekCounter(key) {
+    const c = settings().counters?.[key];
+    if (!c) {
+        return { name: '', lastFloor: 0, backfilledFloor: 0, exports: 0, lastExportAt: '', _exists: false };
+    }
+    return {
+        name: c.name || '',
+        lastFloor: Number(c.lastFloor ?? 0),
+        backfilledFloor: Number(c.backfilledFloor ?? 0),
+        exports: Number(c.exports ?? 0),
+        lastExportAt: c.lastExportAt || '',
+        _exists: true,
+    };
+}
+
+function hasActiveChat(identity) {
+    return Boolean(identity && (identity.chatId || identity.total > 0));
+}
+
+function parseTimestampSlug(slug) {
+    const m = /^(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})$/.exec(String(slug ?? '').trim());
+    if (!m) return null;
+    return {
+        year: Number(m[1]),
+        month: Number(m[2]),
+        day: Number(m[3]),
+        hour: m[4],
+        minute: m[5],
+        second: m[6],
+        full: `${m[1]}-${m[2]}-${m[3]} ${m[4]}:${m[5]}:${m[6]}`,
+    };
+}
+
+/** 把 YYYYMMDD-HHmmss 格式化为更易读的时间，保留完整时间供 tooltip 展示 */
+function formatReadableTime(slug, { compact = false } = {}) {
+    if (!slug) return { text: '尚未导出', full: '' };
+    const p = parseTimestampSlug(slug);
+    if (!p) return { text: String(slug), full: String(slug) };
+    const now = new Date();
+    const sameYear = now.getFullYear() === p.year;
+    const sameDay = sameYear && (now.getMonth() + 1) === p.month && now.getDate() === p.day;
+    const yest = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1);
+    const isYesterday = yest.getFullYear() === p.year && (yest.getMonth() + 1) === p.month && yest.getDate() === p.day;
+    const mm = String(p.month).padStart(2, '0');
+    const dd = String(p.day).padStart(2, '0');
+
+    if (sameDay) return { text: `今天 ${p.hour}:${p.minute}`, full: p.full };
+    if (isYesterday) return { text: `昨天 ${p.hour}:${p.minute}`, full: p.full };
+    if (sameYear) return { text: `${mm}-${dd} ${p.hour}:${p.minute}`, full: p.full };
+    return {
+        text: compact ? `${p.year}-${mm}-${dd}` : `${p.year}-${mm}-${dd} ${p.hour}:${p.minute}`,
+        full: p.full,
+    };
+}
+
+/**
+ * 清理冗长的酒馆聊天 ID：去掉与角色卡名重复的前缀，美化 @HHhMMmSSsNNNms 时间戳，
+ * 并提取 imported 标记；原始 chatId 仍保留在 raw 字段供悬停查看。
+ */
+function formatChatSession(chatId, cardName = '') {
+    const raw = String(chatId ?? '').trim();
+    if (!raw) return { label: '未命名会话', imported: false, raw: '' };
+
+    let text = raw;
+    const prefix = cardName ? `${cardName} - ` : '';
+    if (prefix && text.startsWith(prefix)) {
+        text = text.slice(prefix.length).trim();
+    }
+
+    let imported = false;
+    if (/\s+imported$/i.test(text)) {
+        imported = true;
+        text = text.replace(/\s+imported$/i, '').trim();
+    }
+
+    text = text.replace(
+        /(\d{4}-\d{2}-\d{2})@(\d{2})h(\d{2})m\d{2}s(?:\d+ms)?/g,
+        '$1 $2:$3',
+    );
+
+    return { label: text || raw, imported, raw };
+}
+
 function intervalValue(s = settings()) {
     return Math.max(1, parseInt(s.interval, 10) || 1);
 }
@@ -292,7 +382,7 @@ function shouldExport(identity) {
  */
 function pendingSegments(identity, s = settings()) {
     const interval = intervalValue(s);
-    const counter = getCounter(identity.key);
+    const counter = peekCounter(identity.key);
     const base = Number(counter.backfilledFloor ?? 0);
     const lastFull = Math.floor(identity.floor / interval) * interval;
     const segments = [];
@@ -309,11 +399,21 @@ function formatSegments(segments, maxShown = 8) {
     return `${segments.slice(0, 3).join(' / ')} … ${segments.slice(-2).join(' / ')}（共 ${segments.length} 段）`;
 }
 
+function baselineFloor(identity, s = settings()) {
+    const counter = peekCounter(identity.key);
+    const interval = intervalValue(s);
+    const isUnseen = !counter._exists && !counter.lastFloor && !counter.exports && !counter.lastExportAt;
+    if (isUnseen) {
+        return Math.floor(identity.floor / interval) * interval;
+    }
+    return Math.min(identity.floor, Number(counter.lastFloor ?? 0));
+}
+
 function remainingFloors(identity) {
-    const counter = getCounter(identity.key);
-    if (!counter.lastFloor) return Math.max(1, Number(settings().interval) || 1);
-    const interval = Math.max(1, Number(settings().interval) || 1);
-    return Math.max(0, interval - (identity.floor - counter.lastFloor));
+    const s = settings();
+    const interval = intervalValue(s);
+    const base = baselineFloor(identity, s);
+    return Math.max(0, interval - Math.max(0, identity.floor - base));
 }
 
 /* ------------------------------------------------------------------ *
@@ -580,6 +680,8 @@ async function runBackup({ manual = false } = {}) {
         return { ok: false, reason: 'busy' };
     }
     busy = true;
+    uiState.backingUp = true;
+    syncBusyUI();
     try {
         const s = settings();
         const identity = currentIdentity();
@@ -633,6 +735,8 @@ async function runBackup({ manual = false } = {}) {
         return { ok: false, reason: e?.message || String(e) };
     } finally {
         busy = false;
+        uiState.backingUp = false;
+        syncBusyUI();
     }
 }
 
@@ -673,6 +777,8 @@ async function runBackfill() {
     }
 
     busy = true;
+    uiState.backfillProgress = { current: 0, total: floors.length };
+    syncBusyUI();
     const format = s.format === 'txt' ? 'txt' : 'jsonl';
     const pathSegments = backupPathSegments(identity);
     let handle = null;
@@ -684,6 +790,8 @@ async function runBackfill() {
 
     try {
         for (const target of floors) {
+            uiState.backfillProgress = { current: done + 1, total: floors.length };
+            syncBusyUI();
             try {
                 // 切片导出（独立实现 + 硬校验）：
                 // 截止楼号 target（含），向后吞并紧随的隐藏楼；写入前校验行数，异常即拒绝写盘。
@@ -759,6 +867,8 @@ async function runBackfill() {
         return { ok: false, reason: e?.message || String(e) };
     } finally {
         busy = false;
+        uiState.backfillProgress = null;
+        syncBusyUI();
     }
 }
 
@@ -800,6 +910,78 @@ function panelHost() {
     return document.getElementById('extensions_settings2') || document.getElementById('extensions_settings');
 }
 
+function el(tag, className = '', text = '') {
+    const node = document.createElement(tag);
+    if (className) node.className = className;
+    if (text !== '') node.textContent = text;
+    return node;
+}
+
+function faIcon(cls) {
+    const i = document.createElement('i');
+    i.className = cls;
+    i.setAttribute('aria-hidden', 'true');
+    return i;
+}
+
+function makeSwitch(id, checked, onChange) {
+    const wrap = el('label', 'cab-switch');
+    const input = document.createElement('input');
+    input.type = 'checkbox';
+    if (id) input.id = id;
+    input.checked = Boolean(checked);
+    input.addEventListener('change', () => onChange(input.checked));
+    const track = el('span', 'cab-switch-track');
+    wrap.append(input, track);
+    return { wrap, input };
+}
+
+function makeField(titleText, hintText = '') {
+    const field = el('div', 'cab-field');
+    const label = el('div', 'cab-field-label');
+    label.append(el('span', 'cab-field-title', titleText));
+    if (hintText) label.append(el('span', 'cab-field-hint', hintText));
+    field.append(label);
+    return { field, label };
+}
+
+function makeSegment(id, options, currentValue, onChange) {
+    const group = el('div', 'cab-segment');
+    if (id) group.id = id;
+    for (const [value, text] of options) {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'cab-segment-btn' + (value === currentValue ? ' is-active' : '');
+        btn.dataset.value = value;
+        btn.textContent = text;
+        btn.addEventListener('click', () => {
+            onChange(value);
+        });
+        group.append(btn);
+    }
+    return group;
+}
+
+function setSegmentValue(id, value) {
+    const group = document.getElementById(id);
+    if (!group) return;
+    for (const btn of group.querySelectorAll('.cab-segment-btn')) {
+        btn.classList.toggle('is-active', btn.dataset.value === value);
+    }
+}
+
+function switchTab(tabName) {
+    uiState.activeTab = tabName;
+    const root = document.getElementById('chat_autobackup_content');
+    if (!root) return;
+    for (const btn of root.querySelectorAll('.cab-tab')) {
+        btn.classList.toggle('is-active', btn.dataset.tab === tabName);
+    }
+    for (const panel of root.querySelectorAll('.cab-tab-panel')) {
+        panel.classList.toggle('is-active', panel.dataset.tab === tabName);
+    }
+}
+
 function buildPanel() {
     if (document.getElementById('chat_autobackup_container')) return;
     const host = panelHost();
@@ -808,23 +990,27 @@ function buildPanel() {
         return;
     }
 
-    const container = document.createElement('div');
+    const container = el('div', 'chat-autobackup-container');
     container.id = 'chat_autobackup_container';
-    container.className = 'chat-autobackup-container';
 
-    const drawer = document.createElement('div');
-    drawer.className = 'inline-drawer';
+    const drawer = el('div', 'inline-drawer');
 
-    const header = document.createElement('div');
-    header.className = 'inline-drawer-toggle inline-drawer-header';
-    const title = document.createElement('b');
-    title.textContent = `聊天记录自动备份 (Chat Auto Backup) v${EXT_VERSION}`;
-    const icon = document.createElement('div');
-    icon.className = 'inline-drawer-icon fa-solid fa-circle-chevron-down down';
-    header.append(title, icon);
+    const header = el('div', 'inline-drawer-toggle inline-drawer-header cab-drawer-header');
+    const headerLeft = el('div', 'cab-header-left');
+    headerLeft.append(
+        faIcon('fa-solid fa-box-archive cab-header-icon'),
+        el('span', 'cab-header-title', '聊天记录自动备份'),
+        el('span', 'cab-ver-pill', `v${EXT_VERSION}`),
+    );
+    const headerRight = el('div', 'cab-header-right');
+    const statusDot = el('span', 'cab-header-dot');
+    statusDot.id = 'cab_header_dot';
+    statusDot.title = '自动备份运行状态';
+    const icon = el('div', 'inline-drawer-icon fa-solid fa-circle-chevron-down down');
+    headerRight.append(statusDot, icon);
+    header.append(headerLeft, headerRight);
 
-    const content = document.createElement('div');
-    content.className = 'inline-drawer-content';
+    const content = el('div', 'inline-drawer-content');
     content.id = 'chat_autobackup_content';
 
     drawer.append(header, content);
@@ -837,150 +1023,160 @@ function buildPanel() {
     refreshPanel();
 }
 
-function makeRow(labelText, hintText) {
-    const row = document.createElement('div');
-    row.className = 'cab-row';
-    const label = document.createElement('label');
-    label.className = 'cab-label';
-    label.textContent = labelText;
-    if (hintText) {
-        const hint = document.createElement('small');
-        hint.className = 'cab-hint';
-        hint.textContent = hintText;
-        label.append(hint);
-    }
-    row.append(label);
-    return row;
-}
+function buildSettingsRuleCard(s) {
+    const card = el('div', 'cab-card');
+    card.append(el('div', 'cab-card-title', '备份规则'));
 
-function renderControls(root) {
-    const s = settings();
-
-    // 启用开关
-    const enableRow = makeRow('启用自动备份');
-    const enableBox = document.createElement('input');
-    enableBox.type = 'checkbox';
-    enableBox.checked = s.enabled;
-    enableBox.addEventListener('change', () => {
-        settings().enabled = enableBox.checked;
-        saveSettings();
-    });
-    enableRow.append(enableBox);
-    root.append(enableRow);
-
-    // 楼层间隔
-    const intervalRow = makeRow('导出间隔（楼）', '每新增这么多楼层就导出一次；每个角色卡独立计数');
+    // 导出间隔 + 快捷档位
+    const intervalWrap = el('div', 'cab-field');
+    const intervalRow = el('div', 'cab-field-row');
+    const intervalLabel = el('div', 'cab-field-label');
+    intervalLabel.append(
+        el('span', 'cab-field-title', '导出间隔'),
+        el('span', 'cab-field-hint', '每新增指定楼层自动备份，各角色卡独立计数'),
+    );
+    const inputGroup = el('div', 'cab-input-group');
     const intervalInput = document.createElement('input');
+    intervalInput.id = 'cab_interval_input';
     intervalInput.type = 'number';
     intervalInput.min = '1';
     intervalInput.step = '1';
-    intervalInput.className = 'text_pole cab-number';
-    intervalInput.value = s.interval;
-    intervalInput.addEventListener('change', () => {
-        const value = Math.max(1, parseInt(intervalInput.value, 10) || 1);
+    intervalInput.className = 'cab-number';
+    intervalInput.value = String(s.interval);
+    const applyInterval = (val) => {
+        const value = Math.max(1, parseInt(val, 10) || 1);
         settings().interval = value;
-        intervalInput.value = value;
+        intervalInput.value = String(value);
         saveSettings();
         refreshPanel();
-    });
-    intervalRow.append(intervalInput);
-    root.append(intervalRow);
+    };
+    intervalInput.addEventListener('change', () => applyInterval(intervalInput.value));
+    inputGroup.append(intervalInput, el('span', 'cab-input-suffix', '楼'));
+    intervalRow.append(intervalLabel, inputGroup);
 
-    // 格式
-    const formatRow = makeRow('导出格式', 'jsonl 可回导入酒馆；txt 便于直接阅读');
-    const formatSelect = document.createElement('select');
-    formatSelect.className = 'text_pole cab-select';
-    for (const [value, text] of [['jsonl', 'JSONL（可回导入）'], ['txt', 'TXT（纯文本阅读）']]) {
-        const option = document.createElement('option');
-        option.value = value;
-        option.textContent = text;
-        formatSelect.append(option);
+    const presets = el('div', 'cab-presets');
+    presets.id = 'cab_interval_presets';
+    for (const preset of [10, 20, 50, 100]) {
+        const chip = document.createElement('button');
+        chip.type = 'button';
+        chip.className = 'cab-chip';
+        chip.dataset.preset = String(preset);
+        chip.textContent = `每 ${preset} 楼`;
+        chip.addEventListener('click', () => applyInterval(preset));
+        presets.append(chip);
     }
-    formatSelect.value = s.format;
-    formatSelect.addEventListener('change', () => {
-        settings().format = formatSelect.value;
-        saveSettings();
-    });
-    formatRow.append(formatSelect);
-    root.append(formatRow);
+    intervalWrap.append(intervalRow, presets);
+    card.append(intervalWrap, el('div', 'cab-divider'));
 
-    // 计数模式
-    const countRow = makeRow('计数方式', '全部楼层：用户与 AI 各算一楼；仅 AI 楼层：一轮算一楼');
-    const countSelect = document.createElement('select');
-    countSelect.className = 'text_pole cab-select';
-    for (const [value, text] of [['all', '全部楼层'], ['ai', '仅 AI 楼层']]) {
-        const option = document.createElement('option');
-        option.value = value;
-        option.textContent = text;
-        countSelect.append(option);
-    }
-    countSelect.value = s.countMode;
-    countSelect.addEventListener('change', () => {
-        settings().countMode = countSelect.value;
-        saveSettings();
-    });
-    countRow.append(countSelect);
-    root.append(countRow);
-
-    // 写入方式
-    const writeRow = makeRow('保存方式', '目录写入需授权一次根目录，之后自动按角色卡建子文件夹');
-    const writeSelect = document.createElement('select');
-    writeSelect.className = 'text_pole cab-select';
-    for (const [value, text] of [['fsa', '写入授权目录（按卡分文件夹）'], ['download', '浏览器下载']]) {
-        const option = document.createElement('option');
-        option.value = value;
-        option.textContent = text;
-        writeSelect.append(option);
-    }
-    writeSelect.value = s.writeMode;
-    writeSelect.addEventListener('change', () => {
-        settings().writeMode = writeSelect.value;
+    // 导出格式
+    const fmt = makeField('导出格式', 'JSONL 可完整回导酒馆；TXT 适合直接阅读');
+    fmt.field.append(makeSegment('cab_format_seg', [
+        ['jsonl', 'JSONL（可回导）'],
+        ['txt', 'TXT（纯文本）'],
+    ], s.format, (val) => {
+        settings().format = val;
         saveSettings();
         refreshPanel();
-    });
-    writeRow.append(writeSelect);
-    root.append(writeRow);
+    }));
+    card.append(fmt.field, el('div', 'cab-divider'));
 
-    // 目录授权
-    const dirRow = makeRow('备份根目录', '未授权时自动回退为浏览器下载');
-    const dirBox = document.createElement('div');
-    dirBox.className = 'cab-inline';
-    const dirLabel = document.createElement('span');
+    // 计数方式
+    const cnt = makeField('计数方式', '全部楼层：用户与 AI 各算一楼；仅 AI：一轮算一楼');
+    cnt.field.append(makeSegment('cab_count_seg', [
+        ['all', '全部楼层'],
+        ['ai', '仅 AI 楼层'],
+    ], s.countMode, (val) => {
+        settings().countMode = val;
+        saveSettings();
+        refreshPanel();
+    }));
+    card.append(cnt.field, el('div', 'cab-divider'));
+
+    // 导出后提示
+    const toastRow = el('div', 'cab-field-row');
+    const toastLabel = el('div', 'cab-field-label');
+    toastLabel.append(
+        el('span', 'cab-field-title', '导出完成提醒'),
+        el('span', 'cab-field-hint', '自动或手动导出后在右上角弹出提示'),
+    );
+    const toastSw = makeSwitch('cab_toast_switch', s.toast, (checked) => {
+        settings().toast = checked;
+        saveSettings();
+    });
+    toastRow.append(toastLabel, toastSw.wrap);
+    card.append(toastRow);
+
+    return card;
+}
+
+function buildSettingsStorageCard(s) {
+    const card = el('div', 'cab-card');
+    card.append(el('div', 'cab-card-title', '存储与命名'));
+
+    // 保存方式
+    const wm = makeField('保存方式', '授权目录只需选一次，之后自动按角色卡建文件夹');
+    wm.field.append(makeSegment('cab_write_seg', [
+        ['fsa', '授权目录（推荐）'],
+        ['download', '浏览器下载'],
+    ], s.writeMode, (val) => {
+        settings().writeMode = val;
+        saveSettings();
+        refreshPanel();
+    }));
+    card.append(wm.field);
+
+    // FSA 专属选项组
+    const fsaGroup = el('div', 'cab-field');
+    fsaGroup.id = 'cab_fsa_group';
+
+    const dirBox = el('div', 'cab-dir-box');
+    const dirStatus = el('div', 'cab-dir-status');
+    dirStatus.id = 'cab_dir_status';
+    const dirIcon = faIcon('fa-solid fa-folder');
+    dirIcon.id = 'cab_dir_icon';
+    const dirLabel = el('span', 'cab-dir-name');
     dirLabel.id = 'cab_root_label';
-    dirLabel.className = 'cab-mono';
+    dirStatus.append(dirIcon, dirLabel);
+
+    const dirActions = el('div', 'cab-dir-actions');
     const pickBtn = document.createElement('button');
-    pickBtn.className = 'menu_button cab-btn';
-    pickBtn.textContent = '选择目录';
+    pickBtn.type = 'button';
+    pickBtn.className = 'cab-btn cab-btn-sm cab-btn-primary';
+    pickBtn.append(faIcon('fa-solid fa-folder-open'), el('span', '', '选择备份根目录'));
     pickBtn.addEventListener('click', async () => {
         try {
-            await pickBackupRoot();
-            notify('备份根目录已授权', 'success');
+            const handle = await pickBackupRoot();
+            if (handle) notify('备份根目录已授权', 'success');
         } catch (e) {
             log('选择目录取消或失败', e);
         }
     });
     const clearBtn = document.createElement('button');
-    clearBtn.className = 'menu_button cab-btn';
-    clearBtn.textContent = '清除';
+    clearBtn.id = 'cab_dir_clear_btn';
+    clearBtn.type = 'button';
+    clearBtn.className = 'cab-btn cab-btn-sm cab-btn-ghost';
+    clearBtn.append(faIcon('fa-solid fa-link-slash'), el('span', '', '清除授权'));
     clearBtn.addEventListener('click', async () => {
         await idbDelete(IDB_KEY_ROOT);
         settings().rootName = '';
         saveSettings();
         refreshPanel();
+        notify('已清除目录授权，将回退为浏览器下载', 'info');
     });
-    dirBox.append(dirLabel, pickBtn, clearBtn);
-    dirRow.append(dirBox);
-    root.append(dirRow);
+    dirActions.append(pickBtn, clearBtn);
+    dirBox.append(dirStatus, dirActions);
+    fsaGroup.append(dirBox);
 
     // 目录层级
-    const depthRow = makeRow('目录层级', '默认：角色卡 / 聊天记录，同一张卡的不同聊天各自独立');
+    const depth = makeField('目录层级', '推荐按「角色卡 / 聊天记录」归档，同卡多档互不混淆');
     const depthSelect = document.createElement('select');
-    depthSelect.className = 'text_pole cab-select';
+    depthSelect.id = 'cab_depth_select';
+    depthSelect.className = 'cab-select';
     for (const [value, text] of [
-        ['card_chat', '角色卡 / 聊天记录'],
-        ['card', '仅角色卡'],
-        ['chat', '仅聊天记录'],
-        ['none', '平铺到根目录'],
+        ['card_chat', '角色卡 / 聊天记录（默认）'],
+        ['card', '仅按角色卡分文件夹'],
+        ['chat', '仅按聊天记录分文件夹'],
+        ['none', '全部平铺到根目录'],
     ]) {
         const option = document.createElement('option');
         option.value = value;
@@ -993,17 +1189,19 @@ function renderControls(root) {
         saveSettings();
         refreshPanel();
     });
-    depthRow.append(depthSelect);
-    root.append(depthRow);
+    depth.field.append(depthSelect);
+    fsaGroup.append(depth.field);
 
     // 聊天文件夹命名
-    const chatFolderRow = makeRow('聊天文件夹命名', '创建日期取首楼时间，例：星野光.2026.9.1');
+    const cf = makeField('聊天文件夹命名', '创建日期取首楼时间，例：星野光.2026.9.1');
+    cf.field.id = 'cab_chat_folder_field';
     const chatFolderSelect = document.createElement('select');
-    chatFolderSelect.className = 'text_pole cab-select';
+    chatFolderSelect.id = 'cab_chat_folder_select';
+    chatFolderSelect.className = 'cab-select';
     for (const [value, text] of [
         ['created', '角色卡名.创建日期（推荐）'],
-        ['chatid', '聊天文件名'],
-        ['datetime', '导出时间戳（每次新建）'],
+        ['chatid', '原始聊天文件名'],
+        ['datetime', '每次导出时间戳'],
     ]) {
         const option = document.createElement('option');
         option.value = value;
@@ -1016,117 +1214,178 @@ function renderControls(root) {
         saveSettings();
         refreshPanel();
     });
-    chatFolderRow.append(chatFolderSelect);
-    root.append(chatFolderRow);
+    cf.field.append(chatFolderSelect);
+    fsaGroup.append(cf.field);
+    card.append(fsaGroup);
 
-    // 下载文件名是否含聊天名
-    const dlRow = makeRow('下载文件名含聊天名', '仅影响浏览器下载模式：角色卡——聊天名——USER——楼层数');
-    const dlBox = document.createElement('input');
-    dlBox.type = 'checkbox';
-    dlBox.checked = s.downloadIncludeChat;
-    dlBox.addEventListener('change', () => {
-        settings().downloadIncludeChat = dlBox.checked;
-        saveSettings();
-    });
-    dlRow.append(dlBox);
-    root.append(dlRow);
-
-    // 楼号校准（界面楼号与数组索引不一致时用）
-    const offRow = makeRow('楼号校准', '默认 0 = 与界面 #N（0 起）一致。你的卡状态栏若按 1 起的条数显示楼层数，填 +1 即可对齐；界面比面板小 N 则填 -N');
-    const offInput = document.createElement('input');
-    offInput.type = 'number';
-    offInput.className = 'text_pole cab-num';
-    offInput.step = '1';
-    offInput.value = String(Number(s.floorOffset) || 0);
-    offInput.addEventListener('change', () => {
-        settings().floorOffset = Math.max(-999, Math.min(999, Number(offInput.value) || 0));
+    // 下载模式专属选项
+    const dlGroup = el('div', 'cab-field-row');
+    dlGroup.id = 'cab_dl_group';
+    const dlLabel = el('div', 'cab-field-label');
+    dlLabel.append(
+        el('span', 'cab-field-title', '文件名包含聊天名'),
+        el('span', 'cab-field-hint', '下载模式用：角色卡——聊天名——USER——楼层'),
+    );
+    const dlSw = makeSwitch('cab_dl_include_switch', s.downloadIncludeChat, (checked) => {
+        settings().downloadIncludeChat = checked;
         saveSettings();
         refreshPanel();
     });
-    offRow.append(offInput);
-    root.append(offRow);
+    dlGroup.append(dlLabel, dlSw.wrap);
+    card.append(dlGroup, el('div', 'cab-divider'));
+
+    // 同名文件处理
+    const cflict = makeField('同名文件处理', '追加序号可保留每次手动备份的历史副本');
+    cflict.field.append(makeSegment('cab_conflict_seg', [
+        ['suffix', '追加序号 (2)(3)'],
+        ['overwrite', '覆盖原文件'],
+    ], s.onConflict, (val) => {
+        settings().onConflict = val;
+        saveSettings();
+        refreshPanel();
+    }));
+    card.append(cflict.field);
+
+    // 实时路径预览
+    const preview = el('div', 'cab-preview-box');
+    preview.append(el('span', 'cab-preview-label', '实时导出路径预览'));
+    const previewCode = el('span', 'cab-preview-code');
+    previewCode.id = 'cab_path_preview';
+    preview.append(previewCode);
+    card.append(preview);
+
+    return card;
+}
+
+function buildSettingsAdvancedCard(s) {
+    const details = el('details', 'cab-details');
+    details.id = 'cab_adv_details';
+
+    const summary = document.createElement('summary');
+    const sumLeft = el('div', 'cab-details-summary-left');
+    const advBadge = el('span', 'cab-tag cab-tag-warning cab-is-hidden', '已自定义');
+    advBadge.id = 'cab_adv_badge';
+    sumLeft.append(faIcon('fa-solid fa-wrench'), el('span', '', '高级与楼号校准'), advBadge);
+    summary.append(sumLeft, faIcon('fa-solid fa-chevron-down cab-details-chevron'));
+
+    const body = el('div', 'cab-details-body');
+
+    // 楼号校准
+    const offRow = el('div', 'cab-field-row');
+    const offLabel = el('div', 'cab-field-label');
+    offLabel.append(
+        el('span', 'cab-field-title', '楼号校准偏移'),
+        el('span', 'cab-field-hint', '默认 0 与界面 #N（0 起）一致；界面比面板小 N 填 -N，按 1 起计填 +1'),
+    );
+    const offInput = document.createElement('input');
+    offInput.id = 'cab_offset_input';
+    offInput.type = 'number';
+    offInput.className = 'cab-number';
+    offInput.step = '1';
+    offInput.value = String(Number(s.floorOffset) || 0);
+    offInput.addEventListener('change', () => {
+        const val = Math.max(-999, Math.min(999, Number(offInput.value) || 0));
+        settings().floorOffset = val;
+        offInput.value = String(val);
+        saveSettings();
+        refreshPanel();
+    });
+    offRow.append(offLabel, offInput);
 
     // 切片尾随隐藏楼
-    const swRow = makeRow('切片带隐藏楼', '目标楼之后连续的隐藏楼（脚本变量楼）最多额外带几条；0 = 一条都不带。设大了会把小切片膨胀成整档');
+    const swRow = el('div', 'cab-field-row');
+    const swLabel = el('div', 'cab-field-label');
+    swLabel.append(
+        el('span', 'cab-field-title', '切片带隐藏楼上限'),
+        el('span', 'cab-field-hint', '回溯切片时额外带入目标楼后连续隐藏楼的条数；推荐保持 0'),
+    );
     const swInput = document.createElement('input');
+    swInput.id = 'cab_swallow_input';
     swInput.type = 'number';
-    swInput.className = 'text_pole cab-num';
+    swInput.className = 'cab-number';
     swInput.min = '0';
     swInput.max = '50';
     swInput.step = '1';
     swInput.value = String(Number(s.swallowHidden) || 0);
     swInput.addEventListener('change', () => {
-        settings().swallowHidden = Math.max(0, Math.min(50, Number(swInput.value) || 0));
+        const val = Math.max(0, Math.min(50, Number(swInput.value) || 0));
+        settings().swallowHidden = val;
+        swInput.value = String(val);
         saveSettings();
         refreshPanel();
     });
-    swRow.append(swInput);
-    root.append(swRow);
+    swRow.append(swLabel, swInput);
 
-    // 同名处理
-    const conflictRow = makeRow('同名文件', '追加序号可保留每次备份的历史版本');
-    const conflictSelect = document.createElement('select');
-    conflictSelect.className = 'text_pole cab-select';
-    for (const [value, text] of [['suffix', '追加序号 (2)(3)'], ['overwrite', '覆盖']]) {
-        const option = document.createElement('option');
-        option.value = value;
-        option.textContent = text;
-        conflictSelect.append(option);
-    }
-    conflictSelect.value = s.onConflict;
-    conflictSelect.addEventListener('change', () => {
-        settings().onConflict = conflictSelect.value;
-        saveSettings();
-    });
-    conflictRow.append(conflictSelect);
-    root.append(conflictRow);
+    body.append(offRow, el('div', 'cab-divider'), swRow);
+    details.append(summary, body);
+    return details;
+}
 
-    // 提示开关
-    const toastRow = makeRow('导出后提示');
-    const toastBox = document.createElement('input');
-    toastBox.type = 'checkbox';
-    toastBox.checked = s.toast;
-    toastBox.addEventListener('change', () => {
-        settings().toast = toastBox.checked;
-        saveSettings();
-    });
-    toastRow.append(toastBox);
-    root.append(toastRow);
+function buildOverviewTab() {
+    const panel = el('div', 'cab-tab-panel is-active');
+    panel.dataset.tab = 'overview';
 
-    // 状态区
-    const statusTitle = document.createElement('div');
-    statusTitle.className = 'cab-section-title';
-    statusTitle.textContent = '当前聊天';
-    root.append(statusTitle);
-
-    const statusBox = document.createElement('div');
+    // 当前聊天状态卡容器（动态填充，支持无聊天空状态）
+    const statusBox = el('div');
     statusBox.id = 'cab_status';
-    statusBox.className = 'cab-status';
-    root.append(statusBox);
+    panel.append(statusBox);
 
-    // 操作按钮
-    const actionRow = document.createElement('div');
-    actionRow.className = 'cab-actions';
+    // 历史空档回溯提醒卡（仅当有待回溯段落时展示）
+    const callout = el('div', 'cab-callout cab-is-hidden');
+    callout.id = 'cab_backfill_callout';
 
-    const nowBtn = document.createElement('button');
-    nowBtn.className = 'menu_button cab-btn';
-    nowBtn.textContent = '立即备份当前聊天';
-    nowBtn.addEventListener('click', () => runBackup({ manual: true }));
-    actionRow.append(nowBtn);
+    const calloutHead = el('div', 'cab-callout-head');
+    const calloutTitle = el('span');
+    calloutTitle.id = 'cab_backfill_title';
+    calloutHead.append(faIcon('fa-solid fa-clock-rotate-left'), calloutTitle);
 
+    const calloutDesc = el('div', 'cab-callout-desc');
+    calloutDesc.id = 'cab_backfill_desc';
+
+    const calloutActions = el('div', 'cab-callout-actions');
     const backfillBtn = document.createElement('button');
     backfillBtn.id = 'cab_backfill_btn';
-    backfillBtn.className = 'menu_button cab-btn';
-    backfillBtn.textContent = '回溯备份历史段落';
+    backfillBtn.type = 'button';
+    backfillBtn.className = 'cab-btn cab-btn-sm cab-btn-warning';
     backfillBtn.addEventListener('click', () => runBackfill());
-    actionRow.append(backfillBtn);
+
+    const markBtn = document.createElement('button');
+    markBtn.id = 'cab_mark_btn';
+    markBtn.type = 'button';
+    markBtn.className = 'cab-btn cab-btn-sm cab-btn-ghost';
+    markBtn.title = '不生成文件，仅把过往历史标记为已处理';
+    markBtn.append(faIcon('fa-solid fa-check-double'), el('span', '', '忽略空档'));
+    markBtn.addEventListener('click', () => {
+        try {
+            markBackfilled(currentIdentity());
+        } catch (e) {
+            console.error(`[${MODULE_NAME}] 标记历史空档失败`, e);
+        }
+    });
+    calloutActions.append(backfillBtn, markBtn);
+    callout.append(calloutHead, calloutDesc, calloutActions);
+    panel.append(callout);
+
+    // 主操作按钮栏
+    const actionBar = el('div', 'cab-action-bar');
+    actionBar.id = 'cab_action_bar';
+
+    const nowBtn = document.createElement('button');
+    nowBtn.id = 'cab_now_btn';
+    nowBtn.type = 'button';
+    nowBtn.className = 'cab-btn cab-btn-primary';
+    nowBtn.addEventListener('click', () => runBackup({ manual: true }));
 
     const resetBtn = document.createElement('button');
-    resetBtn.className = 'menu_button cab-btn';
-    resetBtn.textContent = '重置本卡计数';
+    resetBtn.id = 'cab_reset_btn';
+    resetBtn.type = 'button';
+    resetBtn.className = 'cab-btn';
+    resetBtn.title = '将本卡上次导出基线重置为当前楼层，不删除已导出的文件';
+    resetBtn.append(faIcon('fa-solid fa-rotate-left'), el('span', '', '重置计数'));
     resetBtn.addEventListener('click', () => {
         try {
             const identity = currentIdentity();
+            if (!hasActiveChat(identity)) return;
             const s2 = settings();
             s2.counters[identity.key] = {
                 name: identity.cardName,
@@ -1137,16 +1396,73 @@ function renderControls(root) {
             };
             saveSettings();
             refreshPanel();
-            notify(`已把「${identity.cardName}」的计数基线重置为当前 ${identity.floor} 楼`, 'success');
+            notify(`已把「${identity.cardName}」的计数基线重置为当前 #${identity.floor} 楼`, 'success');
         } catch (e) {
             console.error(`[${MODULE_NAME}] 重置计数失败`, e);
         }
     });
-    actionRow.append(resetBtn);
 
+    actionBar.append(nowBtn, resetBtn);
+    panel.append(actionBar);
+
+    // 折叠技术详情（文件名预览、隐藏楼统计、计数键）
+    const techDetails = el('details', 'cab-details');
+    techDetails.id = 'cab_tech_details';
+    const techSum = document.createElement('summary');
+    const techLeft = el('div', 'cab-details-summary-left');
+    techLeft.append(faIcon('fa-solid fa-circle-info'), el('span', '', '技术详情与文件名预览'));
+    techSum.append(techLeft, faIcon('fa-solid fa-chevron-down cab-details-chevron'));
+    const techBody = el('div', 'cab-details-body');
+    const kvList = el('div', 'cab-kv-list');
+    kvList.id = 'cab_tech_kv';
+    techBody.append(kvList);
+    techDetails.append(techSum, techBody);
+    panel.append(techDetails);
+
+    return panel;
+}
+
+function buildRecordsTab() {
+    const panel = el('div', 'cab-tab-panel');
+    panel.dataset.tab = 'records';
+
+    // 搜索框
+    const searchWrap = el('div', 'cab-search-wrap');
+    searchWrap.append(faIcon('fa-solid fa-magnifying-glass cab-search-icon'));
+    const searchInput = document.createElement('input');
+    searchInput.id = 'cab_records_search';
+    searchInput.type = 'text';
+    searchInput.className = 'cab-search-input';
+    searchInput.placeholder = '搜索角色卡名或会话…';
+    const clearBtn = document.createElement('button');
+    clearBtn.id = 'cab_records_search_clear';
+    clearBtn.type = 'button';
+    clearBtn.className = 'cab-search-clear cab-is-hidden';
+    clearBtn.title = '清空搜索';
+    clearBtn.append(faIcon('fa-solid fa-xmark'));
+    searchInput.addEventListener('input', () => {
+        uiState.searchQuery = searchInput.value.trim();
+        clearBtn.classList.toggle('cab-is-hidden', !uiState.searchQuery);
+        refreshPanel();
+    });
+    clearBtn.addEventListener('click', () => {
+        searchInput.value = '';
+        uiState.searchQuery = '';
+        clearBtn.classList.add('cab-is-hidden');
+        refreshPanel();
+        searchInput.focus();
+    });
+    searchWrap.append(searchInput, clearBtn);
+
+    // 汇总与清理工具条
+    const bar = el('div', 'cab-records-bar');
+    const summary = el('span', 'cab-records-summary');
+    summary.id = 'cab_records_summary';
     const pruneBtn = document.createElement('button');
-    pruneBtn.className = 'menu_button cab-btn';
-    pruneBtn.textContent = '清理无效计数';
+    pruneBtn.id = 'cab_prune_btn';
+    pruneBtn.type = 'button';
+    pruneBtn.className = 'cab-btn cab-btn-sm cab-btn-ghost';
+    pruneBtn.title = '清除从未导出过的空计数记录（不会删硬盘文件）';
     pruneBtn.addEventListener('click', () => {
         const s2 = settings();
         const before = Object.keys(s2.counters).length;
@@ -1155,42 +1471,566 @@ function renderControls(root) {
         }
         saveSettings();
         refreshPanel();
-        notify(`已清理 ${before - Object.keys(s2.counters).length} 条从未导出过的计数记录`, 'info');
+        notify(`已清理 ${before - Object.keys(s2.counters).length} 条从未导出过的无效记录`, 'info');
     });
-    actionRow.append(pruneBtn);
+    bar.append(summary, pruneBtn);
 
-    const markBtn = document.createElement('button');
-    markBtn.id = 'cab_mark_btn';
-    markBtn.className = 'menu_button cab-btn';
-    markBtn.textContent = '忽略历史空档';
-    markBtn.addEventListener('click', () => {
-        try {
-            markBackfilled(currentIdentity());
-        } catch (e) {
-            console.error(`[${MODULE_NAME}] 标记历史空档失败`, e);
+    const listWrap = el('div', 'cab-record-list');
+    listWrap.id = 'cab_counters';
+
+    panel.append(searchWrap, bar, listWrap);
+    return panel;
+}
+
+function renderControls(root) {
+    const s = settings();
+
+    // 顶部快捷状态条（总开关 + 存储位置快捷入口）
+    const topbar = el('div', 'cab-topbar');
+    const masterGroup = el('div', 'cab-master-group');
+    const masterSw = makeSwitch('cab_master_toggle', s.enabled, (checked) => {
+        settings().enabled = checked;
+        saveSettings();
+        refreshPanel();
+    });
+    const masterMeta = el('div', 'cab-master-meta');
+    const masterTitle = el('span', 'cab-master-title', '自动备份');
+    const masterSub = el('span', 'cab-master-sub');
+    masterSub.id = 'cab_master_sub';
+    masterMeta.append(masterTitle, masterSub);
+    masterGroup.append(masterSw.wrap, masterMeta);
+
+    const storagePill = document.createElement('button');
+    storagePill.id = 'cab_storage_pill';
+    storagePill.type = 'button';
+    storagePill.className = 'cab-storage-pill';
+    storagePill.addEventListener('click', async () => {
+        const cur = settings();
+        if (cur.writeMode === 'fsa' && fsaSupported()) {
+            try {
+                const handle = await pickBackupRoot();
+                if (handle) notify('备份根目录已授权', 'success');
+            } catch (e) {
+                log('选择目录取消或失败', e);
+            }
+        } else {
+            switchTab('settings');
         }
     });
-    actionRow.append(markBtn);
+    topbar.append(masterGroup, storagePill);
+    root.append(topbar);
 
-    root.append(actionRow);
+    // 三标签导航
+    const tabs = el('div', 'cab-tabs');
+    const tabDefs = [
+        ['overview', 'fa-solid fa-gauge-high', '当前概览'],
+        ['settings', 'fa-solid fa-sliders', '参数设置'],
+        ['records', 'fa-solid fa-layer-group', '全部记录'],
+    ];
+    for (const [id, iconCls, label] of tabDefs) {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'cab-tab' + (id === uiState.activeTab ? ' is-active' : '');
+        btn.dataset.tab = id;
+        btn.append(faIcon(iconCls), el('span', '', label));
+        if (id === 'records') {
+            const badge = el('span', 'cab-tab-badge', '0');
+            badge.id = 'cab_records_badge';
+            btn.append(badge);
+        }
+        btn.addEventListener('click', () => switchTab(id));
+        tabs.append(btn);
+    }
+    root.append(tabs);
 
-    // 计数表
-    const tableTitle = document.createElement('div');
-    tableTitle.className = 'cab-section-title';
-    tableTitle.textContent = '各角色卡计数（相互隔离）';
-    root.append(tableTitle);
+    // 三个标签页面板
+    const settingsPanel = el('div', 'cab-tab-panel');
+    settingsPanel.dataset.tab = 'settings';
+    settingsPanel.append(
+        buildSettingsRuleCard(s),
+        buildSettingsStorageCard(s),
+        buildSettingsAdvancedCard(s),
+    );
 
-    const tableWrap = document.createElement('div');
-    tableWrap.id = 'cab_counters';
-    tableWrap.className = 'cab-counters';
-    root.append(tableWrap);
+    root.append(buildOverviewTab(), settingsPanel, buildRecordsTab());
+}
+
+function syncTopbarAndSettings(s, identity) {
+    const interval = intervalValue(s);
+    const fmtUpper = (s.format === 'txt' ? 'TXT' : 'JSONL');
+
+    // 抽屉标题状态点
+    const dot = document.getElementById('cab_header_dot');
+    if (dot) {
+        dot.classList.toggle('is-paused', !s.enabled);
+        dot.title = s.enabled ? `自动备份运行中（每 ${interval} 楼 · ${fmtUpper}）` : '自动备份已暂停';
+    }
+
+    // 顶部总开关与副标题
+    const masterToggle = document.getElementById('cab_master_toggle');
+    if (masterToggle) masterToggle.checked = Boolean(s.enabled);
+    const masterSub = document.getElementById('cab_master_sub');
+    if (masterSub) {
+        masterSub.textContent = s.enabled ? `每 ${interval} 楼 · ${fmtUpper}` : '已暂停自动触发';
+    }
+
+    // 顶部存储状态胶囊
+    const pill = document.getElementById('cab_storage_pill');
+    if (pill) {
+        pill.textContent = '';
+        pill.className = 'cab-storage-pill';
+        if (s.writeMode === 'fsa') {
+            if (!fsaSupported()) {
+                pill.classList.add('is-warn');
+                pill.append(faIcon('fa-solid fa-triangle-exclamation'), el('span', '', '不支持目录 · 回退下载'));
+                pill.title = '当前浏览器不支持目录授权，点击查看保存设置';
+            } else if (s.rootName) {
+                pill.classList.add('is-ok');
+                pill.append(faIcon('fa-solid fa-folder-open'), el('span', '', s.rootName));
+                pill.title = `已授权根目录：${s.rootName}（点击可更换目录）`;
+            } else {
+                pill.classList.add('is-warn');
+                pill.append(faIcon('fa-solid fa-folder-plus'), el('span', '', '未选目录 · 点此授权'));
+                pill.title = '尚未授权备份根目录，当前会回退为浏览器下载；点击立即授权';
+            }
+        } else {
+            pill.classList.add('is-dl');
+            pill.append(faIcon('fa-solid fa-download'), el('span', '', '浏览器下载'));
+            pill.title = '当前为浏览器下载模式（点击进入设置）';
+        }
+    }
+
+    // 同步设置页控件状态
+    const intervalInput = document.getElementById('cab_interval_input');
+    if (intervalInput && document.activeElement !== intervalInput) intervalInput.value = String(interval);
+    const presets = document.getElementById('cab_interval_presets');
+    if (presets) {
+        for (const chip of presets.querySelectorAll('.cab-chip')) {
+            chip.classList.toggle('is-active', Number(chip.dataset.preset) === interval);
+        }
+    }
+    setSegmentValue('cab_format_seg', s.format);
+    setSegmentValue('cab_count_seg', s.countMode);
+    setSegmentValue('cab_write_seg', s.writeMode);
+    setSegmentValue('cab_conflict_seg', s.onConflict);
+
+    const toastSw = document.getElementById('cab_toast_switch');
+    if (toastSw) toastSw.checked = Boolean(s.toast);
+    const dlSw = document.getElementById('cab_dl_include_switch');
+    if (dlSw) dlSw.checked = Boolean(s.downloadIncludeChat);
+
+    // 条件展示 FSA / 下载选项
+    const isFsa = s.writeMode === 'fsa';
+    document.getElementById('cab_fsa_group')?.classList.toggle('cab-is-hidden', !isFsa);
+    document.getElementById('cab_dl_group')?.classList.toggle('cab-is-hidden', isFsa);
+
+    const depthSelect = document.getElementById('cab_depth_select');
+    if (depthSelect) depthSelect.value = s.folderDepth;
+    const cfSelect = document.getElementById('cab_chat_folder_select');
+    if (cfSelect) cfSelect.value = s.chatFolderName;
+    const cfField = document.getElementById('cab_chat_folder_field');
+    if (cfField) {
+        const needsChatFolder = s.folderDepth === 'card_chat' || s.folderDepth === 'chat';
+        cfField.classList.toggle('cab-is-hidden', !needsChatFolder);
+    }
+
+    // 目录授权状态条
+    const dirStatus = document.getElementById('cab_dir_status');
+    const dirIcon = document.getElementById('cab_dir_icon');
+    const rootLabel = document.getElementById('cab_root_label');
+    const clearBtn = document.getElementById('cab_dir_clear_btn');
+    if (dirStatus && rootLabel) {
+        dirStatus.classList.remove('is-ok', 'is-warn');
+        if (!fsaSupported()) {
+            dirStatus.classList.add('is-warn');
+            if (dirIcon) dirIcon.className = 'fa-solid fa-triangle-exclamation';
+            rootLabel.textContent = '当前浏览器不支持目录写入（将回退下载）';
+        } else if (s.rootName) {
+            dirStatus.classList.add('is-ok');
+            if (dirIcon) dirIcon.className = 'fa-solid fa-circle-check';
+            rootLabel.textContent = `已授权：${s.rootName}`;
+        } else {
+            dirStatus.classList.add('is-warn');
+            if (dirIcon) dirIcon.className = 'fa-solid fa-circle-exclamation';
+            rootLabel.textContent = '尚未授权根目录（将自动回退浏览器下载）';
+        }
+        if (clearBtn) clearBtn.classList.toggle('cab-is-hidden', !s.rootName);
+    }
+
+    // 高级校准自定义徽章与数值同步
+    const offVal = Number(s.floorOffset) || 0;
+    const swVal = Number(s.swallowHidden) || 0;
+    const offInput = document.getElementById('cab_offset_input');
+    if (offInput && document.activeElement !== offInput) offInput.value = String(offVal);
+    const swInput = document.getElementById('cab_swallow_input');
+    if (swInput && document.activeElement !== swInput) swInput.value = String(swVal);
+    document.getElementById('cab_adv_badge')?.classList.toggle('cab-is-hidden', offVal === 0 && swVal === 0);
+
+    // 实时导出路径预览
+    const preview = document.getElementById('cab_path_preview');
+    if (preview) {
+        const sample = hasActiveChat(identity) ? identity : {
+            cardName: '角色卡示例',
+            userName: identity?.userName || 'USER',
+            chatId: '角色卡示例 - 2026-11-23@10h00m00s000ms',
+            floor: 50,
+        };
+        const format = s.format === 'txt' ? 'txt' : 'jsonl';
+        if (isFsa) {
+            const segs = backupPathSegments(sample);
+            const file = buildFileName(sample, format, false, sample.floor);
+            preview.textContent = [s.rootName || '备份根目录', ...segs, file].join('\\');
+        } else {
+            preview.textContent = `浏览器下载目录\\${buildFileName(sample, format, true, sample.floor)}`;
+        }
+    }
+}
+
+function renderOverview(s, identity, pending) {
+    const statusBox = document.getElementById('cab_status');
+    const callout = document.getElementById('cab_backfill_callout');
+    const actionBar = document.getElementById('cab_action_bar');
+    const techDetails = document.getElementById('cab_tech_details');
+    const techKv = document.getElementById('cab_tech_kv');
+    if (!statusBox) return;
+
+    statusBox.textContent = '';
+
+    if (!hasActiveChat(identity)) {
+        const empty = el('div', 'cab-empty-card');
+        empty.append(
+            faIcon('fa-solid fa-comments'),
+            el('div', 'cab-empty-title', '当前未打开聊天'),
+            el('div', 'cab-empty-desc', '请先打开一个角色卡或群聊，此处会实时展示楼层进度并提供快捷备份操作。'),
+        );
+        statusBox.append(empty);
+        callout?.classList.add('cab-is-hidden');
+        actionBar?.classList.add('cab-is-hidden');
+        techDetails?.classList.add('cab-is-hidden');
+        return;
+    }
+
+    actionBar?.classList.remove('cab-is-hidden');
+    techDetails?.classList.remove('cab-is-hidden');
+
+    const counter = peekCounter(identity.key);
+    const interval = intervalValue(s);
+    const base = baselineFloor(identity, s);
+    const remain = remainingFloors(identity);
+    const progressed = Math.max(0, Math.min(interval, identity.floor - base));
+    const pct = Math.min(100, Math.round((progressed / interval) * 100));
+    const nextTarget = base + interval;
+    const session = formatChatSession(identity.chatId, identity.cardName);
+    const lastTime = formatReadableTime(counter.lastExportAt);
+    const format = s.format === 'txt' ? 'txt' : 'jsonl';
+    const pathSegments = backupPathSegments(identity);
+    const targetFolder = s.writeMode === 'fsa'
+        ? [s.rootName || '备份根目录', ...pathSegments].join('\\')
+        : '浏览器下载目录';
+    const previewFile = buildFileName(identity, format, s.writeMode !== 'fsa', identity.floor);
+
+    const card = el('div', 'cab-card');
+
+    // 身份区：角色卡 + USER + 会话时间
+    const heroHead = el('div', 'cab-hero-head');
+    const avatarBadge = el('div', 'cab-avatar-badge');
+    avatarBadge.append(faIcon(identity.isGroup ? 'fa-solid fa-users' : 'fa-solid fa-address-card'));
+    const idCol = el('div', 'cab-hero-identity');
+    const nameEl = el('div', 'cab-hero-name', identity.cardName);
+    nameEl.title = identity.cardName;
+    const subEl = el('div', 'cab-hero-sub');
+    subEl.append(el('span', '', `USER：${identity.userName}`));
+    if (session.label) {
+        subEl.append(el('span', '', '·'));
+        const sessSpan = el('span', '', session.label);
+        sessSpan.title = session.raw;
+        subEl.append(sessSpan);
+    }
+    if (session.imported) subEl.append(el('span', 'cab-tag cab-tag-accent', '导入'));
+    if (identity.isGroup) subEl.append(el('span', 'cab-tag', '群聊'));
+    idCol.append(nameEl, subEl);
+    heroHead.append(avatarBadge, idCol);
+    card.append(heroHead);
+
+    // 楼层与下次自动备份进度条
+    const progBlock = el('div', 'cab-progress-block');
+    const floorRow = el('div', 'cab-floor-row');
+    const floorMain = el('div', 'cab-floor-main');
+    floorMain.append(
+        el('span', 'cab-floor-num', `#${identity.floor}`),
+        el('span', 'cab-floor-unit', `当前楼层 · 共 ${identity.total ?? 0} 条${identity.hidden ? `（${identity.hidden} 隐藏）` : ''}`),
+    );
+    const nextPill = el(
+        'span',
+        'cab-next-pill' + (s.enabled ? '' : ' is-paused'),
+        s.enabled ? (remain === 0 ? '即将自动导出' : `距下次还差 ${remain} 楼`) : '自动备份已暂停',
+    );
+    floorRow.append(floorMain, nextPill);
+
+    const track = el('div', 'cab-progress-track');
+    const fill = el('div', 'cab-progress-fill');
+    fill.style.width = `${pct}%`;
+    track.append(fill);
+
+    const foot = el('div', 'cab-progress-foot');
+    foot.append(
+        el('span', '', `上次基线 #${base}`),
+        el('span', '', `目标 #${nextTarget}（${progressed}/${interval}）`),
+    );
+    progBlock.append(floorRow, track, foot);
+    card.append(progBlock);
+
+    // 三栏核心指标卡
+    const metrics = el('div', 'cab-metrics-grid');
+    const makeTile = (label, value, sub, tone = '', titleTip = '') => {
+        const tile = el('div', 'cab-metric-tile');
+        if (titleTip) tile.title = titleTip;
+        tile.append(
+            el('span', 'cab-metric-label', label),
+            el('span', 'cab-metric-value' + (tone ? ` ${tone}` : ''), value),
+            el('span', 'cab-metric-sub', sub),
+        );
+        return tile;
+    };
+    metrics.append(
+        makeTile('本卡累计导出', `${counter.exports ?? 0} 次`, `上次 #${counter.lastFloor ?? 0} 楼`),
+        makeTile(
+            '最近一次备份',
+            lastTime.text,
+            lastTime.full ? lastTime.full.slice(0, 10) : '等待首次导出',
+            '',
+            lastTime.full ? `精确时间：${lastTime.full}` : '',
+        ),
+        makeTile(
+            '历史回溯',
+            pending.length ? `待补 ${pending.length} 段` : '已齐备',
+            `已回溯至 #${counter.backfilledFloor ?? 0} 楼`,
+            pending.length ? 'is-warn' : 'is-ok',
+        ),
+    );
+    card.append(metrics);
+
+    // 保存路径条
+    const pathBar = el('div', 'cab-path-bar');
+    pathBar.title = `保存位置：${targetFolder}\n文件名：${previewFile}`;
+    pathBar.append(
+        faIcon(s.writeMode === 'fsa' ? 'fa-solid fa-folder-tree' : 'fa-solid fa-download'),
+        el('span', 'cab-path-text', targetFolder),
+    );
+    card.append(pathBar);
+    statusBox.append(card);
+
+    // 历史空档提醒卡片
+    if (callout) {
+        const hasPending = pending.length > 0;
+        callout.classList.toggle('cab-is-hidden', !hasPending);
+        if (hasPending) {
+            const titleEl = document.getElementById('cab_backfill_title');
+            const descEl = document.getElementById('cab_backfill_desc');
+            if (titleEl) titleEl.textContent = `发现 ${pending.length} 段历史楼层尚未备份`;
+            if (descEl) descEl.textContent = `覆盖楼层：${formatSegments(pending, 8)} · 已回溯至 #${counter.backfilledFloor ?? 0} 楼`;
+        }
+    }
+
+    // 折叠技术详情
+    if (techKv) {
+        techKv.textContent = '';
+        const kvs = [
+            ['导出文件名预览', previewFile],
+            ['楼层口径明细', `界面 #${identity.floor}（0 起） / 总消息 ${identity.total ?? 0} 条 / 隐藏楼 ${identity.hidden ?? 0} 条 / 校准偏移 ${Number(s.floorOffset) || 0}`],
+            ['当前计数键 (Key)', identity.key],
+        ];
+        for (const [k, v] of kvs) {
+            const item = el('div', 'cab-kv-item');
+            item.append(el('span', 'cab-kv-key', k), el('span', 'cab-kv-val', v));
+            techKv.append(item);
+        }
+    }
+}
+
+function renderRecords(s, identity) {
+    const countersBox = document.getElementById('cab_counters');
+    const badge = document.getElementById('cab_records_badge');
+    const summaryEl = document.getElementById('cab_records_summary');
+    const pruneBtn = document.getElementById('cab_prune_btn');
+
+    const entries = Object.entries(s.counters || {});
+    const totalCount = entries.length;
+    const inactiveCount = entries.filter(([, c]) => !c || (c.exports === 0 && !c.lastExportAt)).length;
+    const exportedCount = totalCount - inactiveCount;
+
+    if (badge) badge.textContent = String(totalCount);
+
+    if (pruneBtn) {
+        pruneBtn.textContent = '';
+        pruneBtn.append(
+            faIcon('fa-solid fa-broom'),
+            el('span', '', inactiveCount ? `清理无效 (${inactiveCount})` : '无无效记录'),
+        );
+        pruneBtn.disabled = inactiveCount === 0;
+    }
+
+    if (!countersBox) return;
+    countersBox.textContent = '';
+
+    const q = uiState.searchQuery.toLowerCase();
+    const filtered = entries.filter(([key, c]) => {
+        if (!q) return true;
+        const name = String(c?.name || '').toLowerCase();
+        const chatPart = String(key).split(':').slice(2).join(':').toLowerCase();
+        return name.includes(q) || chatPart.includes(q);
+    });
+
+    // 排序：当前会话置顶，其次按最近导出时间倒序、导出次数倒序、楼层倒序
+    filtered.sort(([keyA, a], [keyB, b]) => {
+        const activeA = keyA === identity?.key ? 1 : 0;
+        const activeB = keyB === identity?.key ? 1 : 0;
+        if (activeA !== activeB) return activeB - activeA;
+        const timeA = String(a?.lastExportAt || '');
+        const timeB = String(b?.lastExportAt || '');
+        if (timeA !== timeB) return timeB.localeCompare(timeA);
+        const expDiff = Number(b?.exports ?? 0) - Number(a?.exports ?? 0);
+        if (expDiff !== 0) return expDiff;
+        return Number(b?.lastFloor ?? 0) - Number(a?.lastFloor ?? 0);
+    });
+
+    if (summaryEl) {
+        summaryEl.textContent = q
+            ? `匹配 ${filtered.length} / ${totalCount} 条记录`
+            : `共 ${totalCount} 条记录 · 已导出 ${exportedCount} 条`;
+    }
+
+    if (!totalCount) {
+        const empty = el('div', 'cab-empty-card');
+        empty.append(
+            faIcon('fa-solid fa-inbox'),
+            el('div', 'cab-empty-title', '暂无角色卡计数记录'),
+            el('div', 'cab-empty-desc', '不同角色卡与会话的楼层计数完全隔离，推进聊天或手动备份后会自动建立。'),
+        );
+        countersBox.append(empty);
+        return;
+    }
+
+    if (!filtered.length) {
+        const empty = el('div', 'cab-empty-card');
+        empty.append(
+            faIcon('fa-solid fa-magnifying-glass'),
+            el('div', 'cab-empty-title', '没有匹配的记录'),
+            el('div', 'cab-empty-desc', `未找到包含「${uiState.searchQuery}」的角色卡或会话。`),
+        );
+        countersBox.append(empty);
+        return;
+    }
+
+    for (const [key, counter] of filtered) {
+        const isCurrent = key === identity?.key;
+        const isGroup = String(key).startsWith('group:');
+        const cardName = counter?.name || '(未命名角色卡)';
+        const rawChatId = String(key).split(':').slice(2).join(':');
+        const session = formatChatSession(rawChatId, cardName);
+        const timeInfo = formatReadableTime(counter?.lastExportAt, { compact: true });
+        const exportsCount = Number(counter?.exports ?? 0);
+        const lastFloor = Number(counter?.lastFloor ?? 0);
+        const backfilled = Number(counter?.backfilledFloor ?? 0);
+
+        const item = el('div', 'cab-record-item' + (isCurrent ? ' is-active' : ''));
+
+        // 第一行：角色卡名 + 标签 + 删除图标按钮
+        const top = el('div', 'cab-record-top');
+        const titleWrap = el('div', 'cab-record-title-wrap');
+        const nameEl = el('span', 'cab-record-name', cardName);
+        nameEl.title = cardName;
+        titleWrap.append(nameEl);
+        if (isCurrent) titleWrap.append(el('span', 'cab-tag cab-tag-accent', '当前'));
+        if (isGroup) titleWrap.append(el('span', 'cab-tag', '群聊'));
+
+        const delBtn = document.createElement('button');
+        delBtn.type = 'button';
+        delBtn.className = 'cab-btn cab-btn-icon';
+        delBtn.title = '移除此条计数记录（不会删除已保存的文件）';
+        delBtn.append(faIcon('fa-solid fa-trash-can'));
+        delBtn.addEventListener('click', () => {
+            delete settings().counters[key];
+            saveSettings();
+            refreshPanel();
+            notify(`已移除「${cardName}」的计数记录`, 'info');
+        });
+        top.append(titleWrap, delBtn);
+
+        // 第二行：美化后的会话信息
+        const sessRow = el('div', 'cab-record-session');
+        const sessText = el('span', '', session.label || '—');
+        sessText.title = rawChatId || key;
+        sessRow.append(faIcon('fa-solid fa-clock'), sessText);
+        if (session.imported) sessRow.append(el('span', 'cab-tag', '导入'));
+
+        // 第三行：楼层/回溯/次数徽章 + 最近时间
+        const meta = el('div', 'cab-record-meta');
+        const stats = el('div', 'cab-record-stats');
+        stats.append(
+            el('span', 'cab-stat-pill', `上次 #${lastFloor}`),
+            el('span', 'cab-stat-pill', `回溯 #${backfilled}`),
+            el('span', 'cab-stat-pill' + (exportsCount > 0 ? ' is-highlight' : ''), `导出 ${exportsCount} 次`),
+        );
+        const timeEl = el('span', 'cab-record-time', timeInfo.text);
+        if (timeInfo.full) timeEl.title = `精确时间：${timeInfo.full}`;
+        meta.append(stats, timeEl);
+
+        item.append(top, sessRow, meta);
+        countersBox.append(item);
+    }
+}
+
+function syncBusyUI(pending = null) {
+    const nowBtn = document.getElementById('cab_now_btn');
+    const backfillBtn = document.getElementById('cab_backfill_btn');
+    const markBtn = document.getElementById('cab_mark_btn');
+    const resetBtn = document.getElementById('cab_reset_btn');
+
+    let segs = pending;
+    if (segs === null) {
+        try {
+            segs = pendingSegments(currentIdentity(), settings());
+        } catch (e) {
+            segs = [];
+        }
+    }
+    const count = segs?.length ?? 0;
+
+    if (nowBtn) {
+        nowBtn.textContent = '';
+        if (uiState.backingUp) {
+            nowBtn.append(faIcon('fa-solid fa-spinner fa-spin'), el('span', '', '正在备份…'));
+        } else {
+            nowBtn.append(faIcon('fa-solid fa-floppy-disk'), el('span', '', '立即备份当前聊天'));
+        }
+        nowBtn.disabled = busy;
+    }
+
+    if (backfillBtn) {
+        backfillBtn.textContent = '';
+        if (uiState.backfillProgress) {
+            const { current, total } = uiState.backfillProgress;
+            backfillBtn.append(
+                faIcon('fa-solid fa-spinner fa-spin'),
+                el('span', '', `回溯补齐中 (${current}/${total})…`),
+            );
+        } else {
+            backfillBtn.append(
+                faIcon('fa-solid fa-clock-rotate-left'),
+                el('span', '', count ? `回溯补齐（${count} 段）` : '回溯补齐历史'),
+            );
+        }
+        backfillBtn.disabled = busy || count === 0;
+        backfillBtn.title = count ? `按间隔补齐第 ${formatSegments(segs, 12)} 楼` : '没有待回溯的历史段落';
+    }
+
+    if (markBtn) markBtn.disabled = busy || count === 0;
+    if (resetBtn) resetBtn.disabled = busy;
 }
 
 function refreshPanel() {
-    const rootLabel = document.getElementById('cab_root_label');
-    const statusBox = document.getElementById('cab_status');
-    const countersBox = document.getElementById('cab_counters');
-    if (!statusBox && !countersBox && !rootLabel) return;
+    if (!document.getElementById('chat_autobackup_container')) return;
 
     let s;
     let identity;
@@ -1201,116 +2041,11 @@ function refreshPanel() {
         return;
     }
 
-    const pending = pendingSegments(identity, s);
-
-    if (rootLabel) {
-        rootLabel.textContent = s.writeMode === 'fsa'
-            ? (s.rootName ? `已授权：${s.rootName}` : (fsaSupported() ? '未授权（将回退下载）' : '浏览器不支持目录写入'))
-            : '浏览器下载模式';
-    }
-
-    if (statusBox) {
-        statusBox.textContent = '';
-        const counter = getCounter(identity.key);
-        const pathSegments = backupPathSegments(identity);
-        const rows = [
-            ['角色卡', identity.cardName],
-            ['聊天记录', identity.chatId || '—'],
-            ['USER 名称', identity.userName],
-            ['当前楼层（同界面 #N，0 起）', String(identity.floor)],
-            ['消息总条数 / 隐藏楼', `${identity.total ?? 0} 条（1 起计数） / ${identity.hidden ?? 0} 条隐藏`],
-            ['上次导出楼层', String(counter.lastFloor ?? 0)],
-            ['已回溯至', `${counter.backfilledFloor ?? 0} 楼`],
-            ['待回溯段落', pending.length ? `${pending.length} 段：${formatSegments(pending, 8)}` : '无'],
-            ['距下次导出', `${remainingFloors(identity)} 楼`],
-            ['本卡累计导出', `${counter.exports ?? 0} 次`],
-            ['上次导出时间', counter.lastExportAt || '—'],
-            ['目标文件夹', s.writeMode === 'fsa'
-                ? [s.rootName || '备份根目录', ...pathSegments].join('\\') || '备份根目录'
-                : '浏览器下载目录'],
-            ['计数键', identity.key],
-        ];
-        for (const [k, v] of rows) {
-            const line = document.createElement('div');
-            line.className = 'cab-status-line';
-            const key = document.createElement('span');
-            key.className = 'cab-status-key';
-            key.textContent = `${k}：`;
-            const value = document.createElement('span');
-            value.className = 'cab-status-value cab-mono';
-            value.textContent = v;
-            line.append(key, value);
-            statusBox.append(line);
-        }
-    }
-
-    if (countersBox) {
-        countersBox.textContent = '';
-        const entries = Object.entries(s.counters || {});
-        if (!entries.length) {
-            const empty = document.createElement('div');
-            empty.className = 'cab-empty';
-            empty.textContent = '暂无计数记录，聊天推进后自动建立。';
-            countersBox.append(empty);
-        } else {
-            const table = document.createElement('table');
-            table.className = 'cab-table';
-            const thead = document.createElement('thead');
-            const headRow = document.createElement('tr');
-            for (const text of ['角色卡', '聊天记录', '上次导出楼层', '已回溯至', '累计导出', '上次导出时间', '']) {
-                const th = document.createElement('th');
-                th.textContent = text;
-                headRow.append(th);
-            }
-            thead.append(headRow);
-            table.append(thead);
-
-            const tbody = document.createElement('tbody');
-            for (const [key, counter] of entries) {
-                const tr = document.createElement('tr');
-                if (key === identity.key) tr.className = 'cab-active';
-                const chatLabel = String(key).split(':').slice(2).join(':') || '—';
-                const values = [
-                    counter?.name || '(未命名)',
-                    chatLabel,
-                    String(counter?.lastFloor ?? 0),
-                    `${counter?.backfilledFloor ?? 0} 楼`,
-                    `${counter?.exports ?? 0} 次`,
-                    counter?.lastExportAt || '—',
-                ];
-                for (const text of values) {
-                    const td = document.createElement('td');
-                    td.textContent = text;
-                    tr.append(td);
-                }
-                const tdOps = document.createElement('td');
-                const del = document.createElement('button');
-                del.className = 'menu_button cab-btn cab-btn-mini';
-                del.textContent = '删除';
-                del.addEventListener('click', () => {
-                    delete settings().counters[key];
-                    saveSettings();
-                    refreshPanel();
-                });
-                tdOps.append(del);
-                tr.append(tdOps);
-                tbody.append(tr);
-            }
-            table.append(tbody);
-            countersBox.append(table);
-        }
-    }
-
-    updateBackfillButton(pending);
-}
-
-function updateBackfillButton(pending) {
-    const btn = document.getElementById('cab_backfill_btn');
-    if (!btn) return;
-    const count = pending?.length ?? 0;
-    btn.textContent = count ? `回溯备份历史段落（${count} 段）` : '回溯备份历史段落';
-    btn.disabled = count === 0;
-    btn.title = count ? `将导出第 ${formatSegments(pending, 12)} 楼` : '没有待回溯的历史段落';
+    const pending = hasActiveChat(identity) ? pendingSegments(identity, s) : [];
+    syncTopbarAndSettings(s, identity);
+    renderOverview(s, identity, pending);
+    renderRecords(s, identity);
+    syncBusyUI(pending);
 }
 
 /* ------------------------------------------------------------------ *
@@ -1341,6 +2076,7 @@ function registerSlashCommand() {
                 if (match) {
                     settings().interval = Math.max(1, parseInt(match[1], 10) || 1);
                     saveSettings();
+                    refreshPanel();
                     return `导出间隔已设为每 ${settings().interval} 楼一次`;
                 }
                 await runBackup({ manual: true });
