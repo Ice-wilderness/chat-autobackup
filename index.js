@@ -27,16 +27,19 @@
  */
 
 const MODULE_NAME = 'chat-autobackup';
-const EXT_VERSION = '1.2.1';
+const EXT_VERSION = '1.3.0';
 const IDB_NAME = 'chat-autobackup';
 const IDB_STORE = 'handles';
 const IDB_KEY_ROOT = 'backupRoot';
+const ROLLING_STORE = 'rollingFiles';
+const PERMANENT_INTERVAL = 10;
 const SEPARATOR = '——';
 const REWRITE_DEBOUNCE_MS = 3500;
 
 const DEFAULT_SETTINGS = Object.freeze({
     enabled: true,          // 总开关
     interval: 50,           // 每 X 楼导出一次
+    rollingLimit: 10,       // 高频备份时，每个聊天在当前授权目录保留的普通备份份数
     format: 'jsonl',        // jsonl | txt
     exportSource: 'local',  // local = 本地直出 Blob（更快，支持精确切片）；server = /api/chats/export
     countMode: 'all',       // all = 用户楼+AI楼都计数；ai = 只在 AI 出楼层后计数
@@ -452,12 +455,27 @@ function intervalValue(s = settings()) {
     return Math.max(1, parseInt(s.interval, 10) || 1);
 }
 
+function rollingLimitValue(value) {
+    const limit = Number(value);
+    return Number.isSafeInteger(limit) && limit >= 1 ? limit : DEFAULT_SETTINGS.rollingLimit;
+}
+
+function alignedFloor(floor, interval) {
+    const regular = floor - floor % interval;
+    return interval < PERMANENT_INTERVAL ? Math.max(regular, floor - floor % PERMANENT_INTERVAL) : regular;
+}
+
+function nextBackupFloor(base, interval) {
+    if (interval >= PERMANENT_INTERVAL) return base + interval;
+    return Math.min(base - base % interval + interval, base - base % PERMANENT_INTERVAL + PERMANENT_INTERVAL);
+}
+
 /**
  * 楼层推进后的判定：返回是否需要导出。
  * 首次见到该 key：基线对齐到「当前楼层向下取整的间隔倍数」（例：438 楼 / 间隔 50 → 400），
  * 既不立刻补历史、也不会一到插件就狂导出；历史段落留给「回溯备份」手动补齐。
  */
-function shouldExport(identity) {
+function shouldExport(identity, floorAdvanced = false) {
     const s = settings();
     const existed = Boolean(s.counters?.[identity.key]);
     const counter = getCounter(identity.key);
@@ -465,18 +483,19 @@ function shouldExport(identity) {
     const isFirstSeen = !existed || (!counter.initialized && !counter.lastFloor && counter.exports === 0 && !counter.lastExportAt);
 
     if (isFirstSeen) {
-        counter.lastFloor = Math.floor(identity.floor / interval) * interval;
+        const start = interval < PERMANENT_INTERVAL && floorAdvanced ? Math.max(0, identity.floor - 1) : identity.floor;
+        counter.lastFloor = alignedFloor(start, interval);
         counter.name = identity.cardName;
         counter.initialized = true;
         saveSettings();
         log(`初始化计数基线 key=${identity.key} floor=${identity.floor} → 基线 ${counter.lastFloor}`);
-        return false;
+        return nextBackupFloor(counter.lastFloor, interval) <= identity.floor;
     }
     if (!counter.initialized) counter.initialized = true;
 
     // 聊天被回退/删楼层：基线按间隔重新对齐到不高于当前楼层的倍数，避免后续备份点永久偏移
     if (identity.floor < counter.lastFloor) {
-        const aligned = Math.floor(identity.floor / interval) * interval;
+        const aligned = alignedFloor(identity.floor, interval);
         if (counter.lastFloor !== aligned) {
             counter.lastFloor = aligned;
             if ((counter.backfilledFloor ?? 0) > aligned) {
@@ -489,7 +508,7 @@ function shouldExport(identity) {
         return false;
     }
 
-    return (identity.floor - counter.lastFloor) >= interval;
+    return nextBackupFloor(counter.lastFloor, interval) <= identity.floor;
 }
 
 /**
@@ -501,9 +520,9 @@ function pendingSegments(identity, s = settings()) {
     const interval = intervalValue(s);
     const counter = peekCounter(identity.key);
     const base = Number(counter.backfilledFloor ?? 0);
-    const lastFull = Math.floor(identity.floor / interval) * interval;
     const segments = [];
-    for (let target = Math.ceil((base + 1) / interval) * interval; target <= lastFull; target += interval) {
+    for (let target = nextBackupFloor(alignedFloor(base, interval), interval);
+        target <= identity.floor; target = nextBackupFloor(target, interval)) {
         segments.push(target);
     }
     return segments;
@@ -521,16 +540,9 @@ function baselineFloor(identity, s = settings()) {
     const interval = intervalValue(s);
     const isUnseen = !counter._exists && !counter.lastFloor && !counter.exports && !counter.lastExportAt;
     if (isUnseen) {
-        return Math.floor(identity.floor / interval) * interval;
+        return alignedFloor(identity.floor, interval);
     }
     return Math.min(identity.floor, Number(counter.lastFloor ?? 0));
-}
-
-function remainingFloors(identity) {
-    const s = settings();
-    const interval = intervalValue(s);
-    const base = baselineFloor(identity, s);
-    return Math.max(0, interval - Math.max(0, identity.floor - base));
 }
 
 /* ------------------------------------------------------------------ *
@@ -669,16 +681,26 @@ async function buildExportContent(format, { uptoFloor = null, identity = null } 
 function openDb() {
     if (cachedDbPromise) return cachedDbPromise;
     cachedDbPromise = new Promise((resolve, reject) => {
-        const request = indexedDB.open(IDB_NAME, 1);
+        const request = indexedDB.open(IDB_NAME, 2);
         request.onupgradeneeded = () => {
             const db = request.result;
             if (!db.objectStoreNames.contains(IDB_STORE)) db.createObjectStore(IDB_STORE);
+            if (!db.objectStoreNames.contains(ROLLING_STORE)) {
+                const files = db.createObjectStore(ROLLING_STORE, { keyPath: 'id', autoIncrement: true });
+                files.createIndex('chat', 'chat');
+                files.createIndex('path', 'path');
+            }
         };
         request.onsuccess = () => {
             const db = request.result;
             db.onclose = () => { cachedDbPromise = null; };
+            db.onversionchange = () => {
+                db.close();
+                cachedDbPromise = null;
+            };
             resolve(db);
         };
+        request.onblocked = () => notify('请刷新其他已打开的酒馆页面，以完成备份索引升级。', 'warning');
         request.onerror = () => {
             cachedDbPromise = null;
             reject(request.error);
@@ -773,32 +795,120 @@ async function ensurePermission(handle) {
     }
 }
 
-async function resolveDirectory(handle, segments) {
+async function resolveDirectory(handle, segments, create = true) {
     let dir = handle;
     for (const segment of segments) {
-        dir = await dir.getDirectoryHandle(segment, { create: true });
+        dir = await dir.getDirectoryHandle(segment, { create });
     }
     return dir;
 }
 
-async function listExistingFileNames(dir) {
-    const names = new Set();
-    if (typeof dir?.keys === 'function') {
-        for await (const name of dir.keys()) {
-            names.add(name);
+// 目录句柄由 IndexedDB 持久化。同名根目录、平铺目录里的不同聊天，以及改过的目录层级都可区分。
+async function rollingRecords(index, key) {
+    const db = await openDb();
+    return new Promise((resolve, reject) => {
+        const store = db.transaction(ROLLING_STORE).objectStore(ROLLING_STORE);
+        const request = index ? store.index(index).getAll(key) : store.getAll();
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+    });
+}
+
+async function updateRollingRecords(removed, record = null) {
+    if (!removed.length && !record) return;
+    const db = await openDb();
+    await new Promise((resolve, reject) => {
+        const tx = db.transaction(ROLLING_STORE, 'readwrite');
+        const store = tx.objectStore(ROLLING_STORE);
+        for (const id of removed) store.delete(id);
+        if (record) store.put(record);
+        tx.oncomplete = resolve;
+        tx.onabort = () => reject(tx.error);
+    });
+}
+
+function withBackupLock(action) {
+    return navigator.locks ? navigator.locks.request(MODULE_NAME + '-files', action) : action();
+}
+
+async function trimRollingBackups(root, limit, chat = null) {
+    const records = chat === null ? await rollingRecords() : await rollingRecords('chat', chat);
+    if (records.length <= limit) return;
+    const groups = new Map();
+    for (const record of records) {
+        if (!await root.isSameEntry(record.root)) continue;
+        if (!groups.has(record.chat)) groups.set(record.chat, []);
+        groups.get(record.chat).push(record);
+    }
+    for (const group of groups.values()) {
+        if (group.length <= limit) continue;
+        const live = [];
+        const stale = [];
+        for (const record of group) {
+            try {
+                const dir = await resolveDirectory(root, record.segments, false);
+                const handle = await dir.getFileHandle(record.name);
+                const file = await handle.getFile();
+                if (await handle.isSameEntry(record.handle) && file.size === record.size && file.lastModified === record.modified) {
+                    live.push({ record, dir });
+                    continue;
+                }
+            } catch (e) {
+                if (e.name !== 'NotFoundError' && e.name !== 'TypeMismatchError') throw e;
+            }
+            // 已手动移除或替换的文件只注销记录。
+            stale.push(record.id);
+        }
+        await updateRollingRecords(stale);
+        // 索引按自增主键排序，删楼回退或回溯低楼层也以实际备份顺序为准。
+        for (let i = 0; i < live.length - limit; i += 1) {
+            const { record, dir } = live[i];
+            try {
+                await dir.removeEntry(record.name);
+            } catch (e) {
+                if (e.name !== 'NotFoundError') throw e;
+            }
+            await updateRollingRecords([record.id]);
         }
     }
-    return names;
+}
+
+async function recordBackupWrite(root, segments, fileHandle, { chat, floor, interval }, isRewrite) {
+    const name = fileHandle.name;
+    const path = JSON.stringify([...segments, name]).normalize('NFC').toLowerCase();
+    const matches = await rollingRecords('path', path);
+    const old = [];
+    for (const row of matches) {
+        if (await root.isSameEntry(row.root) && await fileHandle.isSameEntry(row.handle)) old.push(row);
+    }
+    const previous = old.find(row => row.chat === chat);
+    const rolling = interval < PERMANENT_INTERVAL && floor % PERMANENT_INTERVAL !== 0;
+    let record = null;
+    if (isRewrite ? previous : rolling) {
+        const file = await fileHandle.getFile();
+        record = { root, segments, name, handle: fileHandle, path, chat, size: file.size, modified: file.lastModified };
+        if (isRewrite) record.id = previous.id;
+    }
+    await updateRollingRecords(old.map(row => row.id), record);
+    if (interval < PERMANENT_INTERVAL) await trimRollingBackups(root, rollingLimitValue(settings().rollingLimit), chat);
+}
+
+function reportRollingError(error) {
+    console.warn(`[${MODULE_NAME}] 滚动备份清理未完成`, error);
+    notify('滚动备份清理未完成，请检查目录授权。下次高频备份时会重试清理。', 'warning');
 }
 
 /**
  * 写入 <根目录>/<角色卡文件夹>/<文件名>
- * 支持传入已解析的 dirHandle、existingNames（批量回溯免重复 IPC）与 overwriteExact（原地覆写）。
+ * 支持传入已解析的 dirHandle 与 overwriteExact（原地覆写）。
  */
 async function writeViaFsa(handle, segments, fileName, content, options = {}) {
+    return withBackupLock(() => writeBackupFile(handle, segments, fileName, content, options));
+}
+
+async function writeBackupFile(handle, segments, fileName, content, options) {
     const {
         dirHandle = null,
-        existingNames = null,
         overwriteExact = false,
         skipPermissionCheck = false,
     } = options;
@@ -812,33 +922,28 @@ async function writeViaFsa(handle, segments, fileName, content, options = {}) {
     let target = fileName;
     if (!overwriteExact && settings().onConflict === 'suffix') {
         let index = 1;
-        if (existingNames instanceof Set) {
-            while (existingNames.has(target)) {
-                index += 1;
-                target = withSuffix(fileName, index);
+        while (true) {
+            try {
+                await dir.getFileHandle(target);
+            } catch (e) {
+                if (e.name === 'NotFoundError') break;
+                throw e;
             }
-        } else {
-            // eslint-disable-next-line no-constant-condition
-            while (true) {
-                let exists = false;
-                try {
-                    await dir.getFileHandle(target, { create: false });
-                    exists = true;
-                } catch (e) {
-                    exists = false;
-                }
-                if (!exists) break;
-                index += 1;
-                target = withSuffix(fileName, index);
-            }
+            index += 1;
+            target = withSuffix(fileName, index);
         }
     }
 
-    const fileHandle = await dir.getFileHandle(target, { create: true });
+    const fileHandle = await dir.getFileHandle(target, { create: !overwriteExact });
     const writable = await fileHandle.createWritable();
     await writable.write(content);
     await writable.close();
-    if (existingNames instanceof Set) existingNames.add(target);
+    try {
+        await recordBackupWrite(handle, segments, fileHandle, options, overwriteExact);
+    } catch (e) {
+        // 文件已经成功关闭，清理失败不能触发重复下载，也不能推进未完成的删除。
+        reportRollingError(e);
+    }
     return target;
 }
 
@@ -898,11 +1003,15 @@ async function runBackup({
         const s = settings();
         const identity = currentIdentity(false);
         const backupFloor = targetFloor !== null ? Number(targetFloor) : identity.floor;
+        const interval = intervalValue(s);
         const format = formatOverride || (s.format === 'txt' ? 'txt' : 'jsonl');
         const dirFileName = overwriteFile || buildFileName(identity, format, false, backupFloor);
         const downloadName = buildFileName(identity, format, true, backupFloor);
         const segments = Array.isArray(targetSegments) ? targetSegments : backupPathSegments(identity);
         const isRewrite = Boolean(overwriteFile);
+        const messages = Array.isArray(ctx().chat) ? ctx().chat : [];
+        const watchIndex = resolveWatchIndex(messages, backupFloor, Number(s.floorOffset) || 0);
+        const watchFp = watchIndex >= 0 ? messageFingerprint(messages[watchIndex]) : '';
 
         const { content, source } = await buildExportContent(format, {
             uptoFloor: targetFloor,
@@ -918,6 +1027,7 @@ async function runBackup({
                 try {
                     savedAs = await writeViaFsa(handle, segments, dirFileName, content, {
                         overwriteExact: isRewrite,
+                        chat: identity.key, floor: backupFloor, interval,
                     });
                     mode = 'fsa';
                 } catch (e) {
@@ -939,20 +1049,15 @@ async function runBackup({
         }
 
         const counter = getCounter(identity.key);
-        const messages = Array.isArray(ctx().chat) ? ctx().chat : [];
-        const watchIndex = resolveWatchIndex(messages, backupFloor, Number(s.floorOffset) || 0);
-        const watchFp = watchIndex >= 0 ? messageFingerprint(messages[watchIndex]) : '';
-
         counter.name = identity.cardName;
         counter.initialized = true;
         if (!isRewrite) {
             counter.lastFloor = backupFloor;
             counter.exports = (counter.exports || 0) + 1;
             if (!manual) {
-                const interval = intervalValue(s);
-                const aligned = Math.floor(backupFloor / interval) * interval;
-                const prevAligned = Math.max(0, aligned - interval);
-                if ((counter.backfilledFloor ?? 0) >= prevAligned && aligned > (counter.backfilledFloor ?? 0)) {
+                const aligned = alignedFloor(backupFloor, interval);
+                const base = Number(counter.backfilledFloor ?? 0);
+                if (aligned > base && nextBackupFloor(alignedFloor(base, interval), interval) === aligned) {
                     counter.backfilledFloor = aligned;
                 }
             }
@@ -1100,6 +1205,7 @@ async function runBackfill() {
         return { ok: false, reason: e?.message || String(e) };
     }
 
+    const interval = intervalValue(s);
     const floors = pendingSegments(identity, s);
     if (!floors.length) {
         notify('没有待回溯的历史段落（历史已补齐，或当前楼层不足一个间隔）', 'info');
@@ -1124,16 +1230,12 @@ async function runBackfill() {
 
     let handle = null;
     let dirHandle = null;
-    let existingNames = null;
     if (s.writeMode === 'fsa' && fsaSupported()) {
         handle = await getRootHandle();
         if (handle) {
             if (await ensurePermission(handle)) {
                 try {
                     dirHandle = await resolveDirectory(handle, pathSegments);
-                    if (s.onConflict === 'suffix') {
-                        existingNames = await listExistingFileNames(dirHandle);
-                    }
                 } catch (e) {
                     log('回溯：预解析 FSA 目录失败，将回退下载', e);
                     handle = null;
@@ -1162,6 +1264,7 @@ async function runBackfill() {
             uiState.backfillProgress = { current: done + 1, total: floors.length };
             syncBusyUI(floors);
             try {
+                if (currentIdentity(false).key !== identity.key) throw new Error('当前聊天已切换');
                 const all = Array.isArray(ctx().chat) ? ctx().chat : [];
                 const { end } = sliceEnd(all, target, offset);
                 const expectedRaw = target - offset;
@@ -1222,7 +1325,7 @@ async function runBackfill() {
                     try {
                         savedAs = await writeViaFsa(handle, pathSegments, dirName, blob, {
                             dirHandle,
-                            existingNames,
+                            chat: identity.key, floor: target, interval,
                             skipPermissionCheck: true,
                         });
                     } catch (e) {
@@ -1252,7 +1355,10 @@ async function runBackfill() {
         counter.backfilledFloor = lastOk;
         counter.exports = (counter.exports || 0) + done;
         if (done > 0) counter.lastExportAt = timestampSlug();
-        if ((counter.lastFloor ?? 0) < lastOk) counter.lastFloor = lastOk;
+        if ((counter.lastFloor ?? 0) < lastOk) {
+            counter.lastFloor = lastOk;
+            clearCounterRewriteMeta(counter);
+        }
         saveSettings();
 
         if (done > 0) {
@@ -1271,6 +1377,10 @@ async function runBackfill() {
         busy = false;
         uiState.backfillProgress = null;
         syncBusyUI();
+        if (pendingRecheck) {
+            pendingRecheck = false;
+            setTimeout(() => onChatActivity('recheck'), 0);
+        }
     }
 }
 
@@ -1278,7 +1388,7 @@ async function runBackfill() {
 function markBackfilled(identity) {
     const counter = getCounter(identity.key);
     const interval = intervalValue();
-    counter.backfilledFloor = Math.floor(identity.floor / interval) * interval;
+    counter.backfilledFloor = alignedFloor(identity.floor, interval);
     counter.name = identity.cardName;
     saveSettings();
     scheduleRefresh({ force: true });
@@ -1326,6 +1436,8 @@ async function onChatActivity(trigger, eventArg = null) {
         // 1. 方案 B：已推进到后续楼层时，先检查上一里程碑在离开前是否有未落盘的重生成/Swipe 定稿
         if (trigger !== 'delete' && counterPeek._exists && identity.floor > counterPeek.lastFloor) {
             await finalizePreviousMilestoneIfNeeded(identity);
+            const live = currentIdentity(false);
+            if (live.key !== identity.key || live.floor !== identity.floor) return;
         }
 
         // 2. 停留在刚备份过的里程碑楼层发生重生成/Swipe/编辑：安排防抖原地覆写（仅 FSA 模式）
@@ -1372,7 +1484,7 @@ async function onChatActivity(trigger, eventArg = null) {
         }
 
         // 5. 常规里程碑触发判定（含空回拦截：空消息不导出且不推进 lastFloor）
-        if (shouldExport(identity)) {
+        if (shouldExport(identity, trigger === 'ai' || trigger === 'user')) {
             if (s.skipEmptyReply && isTargetReplyEmpty(messages, identity, eventArg, offset)) {
                 uiState.deferredKey = identity.key;
                 uiState.deferredReason = `#${identity.floor} 楼内容为空，已延后备份`;
@@ -1381,7 +1493,26 @@ async function onChatActivity(trigger, eventArg = null) {
                 return;
             }
             log(`触发自动备份 key=${identity.key} floor=${identity.floor} interval=${s.interval}`);
-            await runBackup();
+            const interval = intervalValue(s);
+            if (interval >= PERMANENT_INTERVAL) {
+                await runBackup();
+                return;
+            }
+            // 一次事件可能跨过多个节点（例如仅 AI 触发），逐个按实际楼号切片。
+            const counter = getCounter(identity.key);
+            for (let floor = nextBackupFloor(counter.lastFloor, interval);
+                floor <= identity.floor; floor = nextBackupFloor(floor, interval)) {
+                // 仅 AI 模式下，普通节点等本次有效事件再导出，跨过的整十楼仍须单独保存。
+                if (s.countMode === 'ai' && floor < identity.floor && floor % PERMANENT_INTERVAL !== 0) {
+                    floor = Math.min(identity.floor, floor - floor % PERMANENT_INTERVAL + PERMANENT_INTERVAL);
+                }
+                const live = currentIdentity(false);
+                if (live.key !== identity.key || live.floor < floor || !s.enabled || intervalValue(s) !== interval) break;
+                if (floor <= counter.lastFloor) continue;
+                if (s.skipEmptyReply && isMessageEmpty(messages[resolveWatchIndex(messages, floor, offset)])) continue;
+                const result = await runBackup({ targetFloor: floor === live.floor ? null : floor });
+                if (!result.ok) break;
+            }
         } else {
             if (uiState.deferredKey === identity.key && !isTargetReplyEmpty(messages, identity, eventArg, offset)) {
                 uiState.deferredReason = '';
@@ -1599,6 +1730,38 @@ function buildSettingsRuleCard(s) {
     }
     intervalWrap.append(intervalRow, presets);
     card.append(intervalWrap, el('div', 'cab-divider'));
+
+    const rolling = makeField('普通备份保留上限', '间隔为 1～9 楼时，每个整十楼永久保存。每个聊天在授权目录内只保留最近的指定份数，超出时先删最早的普通备份。浏览器下载的文件需手动清理。');
+    const limitGroup = el('div', 'cab-input-group');
+    const limitInput = document.createElement('input');
+    limitInput.id = 'cab_rolling_limit';
+    limitInput.type = 'number';
+    limitInput.min = '1';
+    limitInput.step = '1';
+    limitInput.className = 'cab-number';
+    limitInput.setAttribute('aria-label', '每个聊天的普通备份保留上限');
+    limitInput.value = String(rollingLimitValue(s.rollingLimit));
+    limitInput.addEventListener('change', async () => {
+        const limit = limitInput.valueAsNumber;
+        if (!Number.isSafeInteger(limit) || limit < 1) {
+            limitInput.value = String(rollingLimitValue(s.rollingLimit));
+            return;
+        }
+        s.rollingLimit = limit;
+        saveSettings();
+        if (intervalValue(s) >= PERMANENT_INTERVAL || s.writeMode !== 'fsa' || !fsaSupported()) return;
+        try {
+            const root = await getRootHandle();
+            if (root && await ensurePermission(root)) {
+                await withBackupLock(() => trimRollingBackups(root, rollingLimitValue(s.rollingLimit)));
+            }
+        } catch (e) {
+            reportRollingError(e);
+        }
+    });
+    limitGroup.append(limitInput, el('span', 'cab-input-suffix', '份 / 聊天'));
+    rolling.field.append(limitGroup);
+    card.append(rolling.field, el('div', 'cab-divider'));
 
     // 导出格式
     const fmt = makeField('导出格式', 'JSONL 可完整回导酒馆；TXT 适合直接阅读');
@@ -2222,6 +2385,8 @@ function syncTopbarAndSettings(s, identity, { syncSettingsTab = true } = {}) {
     // 同步设置页控件状态
     const intervalInput = document.getElementById('cab_interval_input');
     if (intervalInput && document.activeElement !== intervalInput) intervalInput.value = String(interval);
+    const limitInput = document.getElementById('cab_rolling_limit');
+    if (limitInput && document.activeElement !== limitInput) limitInput.value = String(rollingLimitValue(s.rollingLimit));
     const presets = document.getElementById('cab_interval_presets');
     if (presets) {
         for (const chip of presets.querySelectorAll('.cab-chip')) {
@@ -2340,10 +2505,11 @@ function renderOverview(s, identity, pending) {
     const counter = peekCounter(identity.key);
     const interval = intervalValue(s);
     const base = baselineFloor(identity, s);
-    const remain = remainingFloors(identity);
-    const progressed = Math.max(0, Math.min(interval, identity.floor - base));
-    const pct = Math.min(100, Math.round((progressed / interval) * 100));
-    const nextTarget = base + interval;
+    const nextTarget = nextBackupFloor(base, interval);
+    const span = nextTarget - base;
+    const remain = Math.max(0, nextTarget - identity.floor);
+    const progressed = Math.max(0, Math.min(span, identity.floor - base));
+    const pct = Math.round(progressed / span * 100);
     const session = formatChatSession(identity.chatId, identity.cardName);
     const lastTime = formatReadableTime(counter.lastExportAt);
     const format = s.format === 'txt' ? 'txt' : 'jsonl';
@@ -2409,7 +2575,7 @@ function renderOverview(s, identity, pending) {
     const foot = el('div', 'cab-progress-foot');
     foot.append(
         el('span', '', `上次基线 #${base}`),
-        el('span', '', `目标 #${nextTarget}（${progressed}/${interval}）`),
+        el('span', '', `目标 #${nextTarget}（${progressed}/${span}）`),
     );
     progBlock.append(floorRow, track, foot);
     card.append(progBlock);
