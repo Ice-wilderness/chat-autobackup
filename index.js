@@ -27,7 +27,7 @@
  */
 
 const MODULE_NAME = 'chat-autobackup';
-const EXT_VERSION = '1.3.1';
+const EXT_VERSION = '1.3.2';
 const IDB_NAME = 'chat-autobackup';
 const IDB_STORE = 'handles';
 const IDB_KEY_ROOT = 'backupRoot';
@@ -184,8 +184,13 @@ function countHidden(messages) {
     return n;
 }
 
+function isSystemUtilityMessage(msg) {
+    if (!msg) return true;
+    return Boolean(msg.extra?.isSmallSys || msg.name === 'SillyTavern System');
+}
+
 function isAiMessage(msg) {
-    return Boolean(msg && !msg.is_user && !msg.is_system);
+    return Boolean(msg && !msg.is_user && !isSystemUtilityMessage(msg));
 }
 
 /**
@@ -254,12 +259,12 @@ function messageFingerprint(msg) {
     return `${swipeId}:${swipesLen}:${mes.length}:${fastHash32(mes)}:${display ? fastHash32(display) : ''}`;
 }
 
-/** 获取指定楼号之前（含）最近一条非隐藏消息下标；找不到则回退 rawIndex。 */
+/** 获取指定楼号之前（含）最近一条有效对话消息下标；找不到则回退 rawIndex。 */
 function resolveWatchIndex(messages, floor, floorOffset = Number(settings().floorOffset) || 0) {
     if (!Array.isArray(messages) || messages.length === 0) return -1;
     const raw = Math.max(0, Math.min(messages.length - 1, Number(floor) - floorOffset));
     for (let i = raw; i >= 0; i -= 1) {
-        if (!messages[i]?.is_system) return i;
+        if (!isSystemUtilityMessage(messages[i])) return i;
     }
     return raw;
 }
@@ -1566,7 +1571,7 @@ function markBackfilled(identity) {
 }
 
 function isTargetReplyEmpty(messages, identity, eventArg, offset) {
-    const idx = (typeof eventArg === 'number' && Number.isInteger(eventArg) && eventArg >= 0 && eventArg < messages.length && !messages[eventArg]?.is_system)
+    const idx = (typeof eventArg === 'number' && Number.isInteger(eventArg) && eventArg >= 0 && eventArg < messages.length && !isSystemUtilityMessage(messages[eventArg]))
         ? eventArg
         : resolveWatchIndex(messages, identity.floor, offset);
     if (idx < 0) return true;
