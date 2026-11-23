@@ -27,19 +27,23 @@
  */
 
 const MODULE_NAME = 'chat-autobackup';
-const EXT_VERSION = '1.1.4';
+const EXT_VERSION = '1.2.0';
 const IDB_NAME = 'chat-autobackup';
 const IDB_STORE = 'handles';
 const IDB_KEY_ROOT = 'backupRoot';
 const SEPARATOR = '——';
+const REWRITE_DEBOUNCE_MS = 3500;
 
 const DEFAULT_SETTINGS = Object.freeze({
     enabled: true,          // 总开关
     interval: 50,           // 每 X 楼导出一次
     format: 'jsonl',        // jsonl | txt
+    exportSource: 'local',  // local = 本地直出 Blob（更快，支持精确切片）；server = /api/chats/export
     countMode: 'all',       // all = 用户楼+AI楼都计数；ai = 只在 AI 出楼层后计数
+    skipEmptyReply: true,   // 空回拦截：最新楼为空白或空思维链外壳时延后备份
+    updateLatestOnRewrite: true, // 在 FSA 模式下重生成/Swipe/编辑当前里程碑楼层时自动原地覆写更新
     writeMode: 'fsa',       // fsa = 写入授权目录（按卡分文件夹）；download = 浏览器下载
-    saveBeforeExport: true, // 导出前先 saveChat，保证服务端 jsonl 是最新的
+    saveBeforeExport: true, // 仅 server 模式生效：导出前先 saveChat，保证服务端 jsonl 是最新的
     toast: true,            // 导出完成提示
     onConflict: 'suffix',   // suffix = 同名追加序号；overwrite = 覆盖
     folderDepth: 'card_chat',        // card_chat = 角色卡/聊天；card = 角色卡；chat = 聊天；none = 平铺
@@ -47,16 +51,29 @@ const DEFAULT_SETTINGS = Object.freeze({
     downloadIncludeChat: true,       // 下载模式下把聊天名并入文件名，避免同卡多聊天混淆
     floorOffset: 0,          // 楼号校准：面板楼号与界面楼号差多少就填多少（界面小 2 就填 -2）
     swallowHidden: 0,        // 切片时最多额外吞并目标楼之后的连续隐藏楼条数（0 = 一个都不带）
-    counters: {},           // { [key]: { name, lastFloor, exports, lastExportAt } }
+    counters: {},           // { [key]: { name, lastFloor, backfilledFloor, exports, lastExportAt, ... } }
     rootName: '',           // 已授权根目录名（仅用于展示）
 });
 
 let busy = false;
+let pendingRecheck = false;
+let rewriteTimer = null;
+let rewritePendingKey = '';
+let cachedSettingsRef = null;
+let cachedDbPromise = null;
+let cachedRootHandle = undefined; // undefined = 未读取；null = 无句柄
+let refreshRafId = 0;
+let panelDirty = false;
+let searchDebounceTimer = null;
+
 const uiState = {
     activeTab: 'overview',
     searchQuery: '',
     backingUp: false,
     backfillProgress: null, // { current, total } | null
+    deferredReason: '',     // 非空表示当前处于空回延后状态
+    deferredKey: '',
+    rewritePending: false,
 };
 
 /* ------------------------------------------------------------------ *
@@ -79,11 +96,14 @@ function settings() {
         context.extensionSettings[MODULE_NAME] = { ...DEFAULT_SETTINGS, counters: {} };
     }
     const s = context.extensionSettings[MODULE_NAME];
-    // 补齐新增字段，不覆盖用户已有值
-    for (const [k, v] of Object.entries(DEFAULT_SETTINGS)) {
-        if (s[k] === undefined) s[k] = (k === 'counters') ? {} : v;
+    if (s !== cachedSettingsRef) {
+        // 仅在初始化或外部替换设置对象引用时补齐新增字段，避免高频重复遍历
+        for (const [k, v] of Object.entries(DEFAULT_SETTINGS)) {
+            if (s[k] === undefined) s[k] = (k === 'counters') ? {} : v;
+        }
+        if (!s.counters || typeof s.counters !== 'object') s.counters = {};
+        cachedSettingsRef = s;
     }
-    if (!s.counters || typeof s.counters !== 'object') s.counters = {};
     return s;
 }
 
@@ -125,7 +145,7 @@ function timestampSlug(date = new Date()) {
  * 上下文读取：角色卡名 / USER 名 / 楼层 / 计数 key
  * ------------------------------------------------------------------ */
 
-function currentIdentity() {
+function currentIdentity(includeHidden = true) {
     const context = ctx();
     const isGroup = Boolean(context.groupId);
     const chatId = context.getCurrentChatId?.() ?? '';
@@ -146,7 +166,7 @@ function currentIdentity() {
     // 且 ST 核心 CSS 无任何隐藏 [is_system] 的规则 → 隐藏楼就是真实楼层。
     // 若你的界面显示仍与面板差 N 楼，用设置项「楼号校准」填 -N 即可，无需改代码。
     const total = Array.isArray(context.chat) ? context.chat.length : 0;
-    const hidden = countHidden(context.chat);
+    const hidden = includeHidden ? countHidden(context.chat) : null;
     const floor = Math.max(0, (total - 1) + (Number(settings().floorOffset) || 0));
     const key = `${isGroup ? 'group' : 'char'}:${entityId}:${chatId}`;
 
@@ -161,16 +181,65 @@ function countHidden(messages) {
     return n;
 }
 
+/** 剥离纯空白思维链空壳与 HTML 注释，判断消息是否属于“空回”。 */
+function isMessageEmpty(msg) {
+    if (!msg) return true;
+    const hasMedia = Array.isArray(msg.extra?.media) && msg.extra.media.length > 0;
+    if (hasMedia) return false;
+
+    const raw = String(msg.extra?.display_text ?? msg.mes ?? '');
+    if (!raw.trim()) return true;
+
+    const stripped = raw
+        .replace(/<!--[\s\S]*?-->/g, '')
+        .replace(/<(think|thinking)\b[^>]*>\s*<\/\1>/gi, '')
+        .replace(/^\s*<(think|thinking)\b[^>]*>\s*$/gim, '')
+        .trim();
+    return stripped.length === 0;
+}
+
+/** 快速 FNV-1a 32位哈希，避免把整条消息文本存进 settings。 */
+function fastHash32(str) {
+    let hash = 0x811c9dc5;
+    const text = String(str ?? '');
+    for (let i = 0; i < text.length; i += 1) {
+        hash ^= text.charCodeAt(i);
+        hash = Math.imul(hash, 0x01000193);
+    }
+    return (hash >>> 0).toString(16);
+}
+
+/** 计算单条消息的内容指纹（包含当前正文、swipe_id 与 swipes 数量）。 */
+function messageFingerprint(msg) {
+    if (!msg) return '';
+    const mes = String(msg.mes ?? '');
+    const display = msg.extra?.display_text !== undefined ? String(msg.extra.display_text) : '';
+    const swipeId = msg.swipe_id ?? '';
+    const swipesLen = Array.isArray(msg.swipes) ? msg.swipes.length : 0;
+    return `${swipeId}:${swipesLen}:${mes.length}:${fastHash32(mes)}:${display ? fastHash32(display) : ''}`;
+}
+
+/** 获取指定楼号之前（含）最近一条非隐藏消息下标；找不到则回退 rawIndex。 */
+function resolveWatchIndex(messages, floor, floorOffset = Number(settings().floorOffset) || 0) {
+    if (!Array.isArray(messages) || messages.length === 0) return -1;
+    const raw = Math.max(0, Math.min(messages.length - 1, Number(floor) - floorOffset));
+    for (let i = raw; i >= 0; i -= 1) {
+        if (!messages[i]?.is_system) return i;
+    }
+    return raw;
+}
+
 /**
- * 切片终点：截止到楼号 target（含）=> 索引 [0, target+1)。
+ * 切片终点：截止到界面楼号 target（含）=> 结合 floorOffset 换算数组索引 [0, rawIndex + 1)。
  * 可选向后吞并紧随的隐藏楼，但有硬上限（默认 0，绝不吞并）：
  * 星光旅途这类 MVU 卡会连续注入上百条隐藏楼，无上限吞并会把 50 楼的切片膨胀成整档。
  */
-function sliceEnd(messages, target) {
+function sliceEnd(messages, target, offset = Number(settings().floorOffset) || 0) {
     const len = Array.isArray(messages) ? messages.length : 0;
-    if (len === 0) return 0;
+    if (len === 0) return { end: 0, swallowed: 0 };
     const cap = Math.max(0, Math.min(50, Number(settings().swallowHidden) || 0));
-    let end = Math.max(0, Math.min(Number(target) + 1, len));
+    const rawTarget = Number(target) - offset;
+    let end = Math.max(0, Math.min(rawTarget + 1, len));
     let swallowed = 0;
     while (end < len && messages[end]?.is_system && swallowed < cap) {
         end += 1;
@@ -252,10 +321,31 @@ function buildFileName(identity, format, forDownload = false, floor = null) {
 function getCounter(key) {
     const s = settings();
     if (!s.counters[key]) {
-        s.counters[key] = { name: '', lastFloor: 0, backfilledFloor: 0, exports: 0, lastExportAt: '' };
+        s.counters[key] = {
+            name: '',
+            lastFloor: 0,
+            backfilledFloor: 0,
+            exports: 0,
+            lastExportAt: '',
+            initialized: false,
+            lastBackupFile: '',
+            lastBackupFp: '',
+            lastBackupWatchIndex: -1,
+            lastBackupFormat: '',
+            lastBackupSegments: [],
+        };
     }
     if (s.counters[key].backfilledFloor === undefined) s.counters[key].backfilledFloor = 0;
     return s.counters[key];
+}
+
+function clearCounterRewriteMeta(counter) {
+    if (!counter) return;
+    counter.lastBackupFile = '';
+    counter.lastBackupFp = '';
+    counter.lastBackupWatchIndex = -1;
+    counter.lastBackupFormat = '';
+    counter.lastBackupSegments = [];
 }
 
 /** 只读读取计数记录，避免仅仅刷新面板时污染 counters 字典 */
@@ -270,6 +360,11 @@ function peekCounter(key) {
         backfilledFloor: Number(c.backfilledFloor ?? 0),
         exports: Number(c.exports ?? 0),
         lastExportAt: c.lastExportAt || '',
+        lastBackupFile: c.lastBackupFile || '',
+        lastBackupFp: c.lastBackupFp || '',
+        lastBackupWatchIndex: Number(c.lastBackupWatchIndex ?? -1),
+        lastBackupFormat: c.lastBackupFormat || '',
+        lastBackupSegments: Array.isArray(c.lastBackupSegments) ? c.lastBackupSegments : [],
         _exists: true,
     };
 }
@@ -292,16 +387,27 @@ function parseTimestampSlug(slug) {
     };
 }
 
+function getNowDateParts(now = new Date()) {
+    const yest = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1);
+    return {
+        year: now.getFullYear(),
+        month: now.getMonth() + 1,
+        day: now.getDate(),
+        yYear: yest.getFullYear(),
+        yMonth: yest.getMonth() + 1,
+        yDay: yest.getDate(),
+    };
+}
+
 /** 把 YYYYMMDD-HHmmss 格式化为更易读的时间，保留完整时间供 tooltip 展示 */
-function formatReadableTime(slug, { compact = false } = {}) {
+function formatReadableTime(slug, { compact = false, nowParts = null } = {}) {
     if (!slug) return { text: '尚未导出', full: '' };
     const p = parseTimestampSlug(slug);
     if (!p) return { text: String(slug), full: String(slug) };
-    const now = new Date();
-    const sameYear = now.getFullYear() === p.year;
-    const sameDay = sameYear && (now.getMonth() + 1) === p.month && now.getDate() === p.day;
-    const yest = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1);
-    const isYesterday = yest.getFullYear() === p.year && (yest.getMonth() + 1) === p.month && yest.getDate() === p.day;
+    const d = nowParts || getNowDateParts();
+    const sameYear = d.year === p.year;
+    const sameDay = sameYear && d.month === p.month && d.day === p.day;
+    const isYesterday = d.yYear === p.year && d.yMonth === p.month && d.yDay === p.day;
     const mm = String(p.month).padStart(2, '0');
     const dd = String(p.day).padStart(2, '0');
 
@@ -353,26 +459,37 @@ function intervalValue(s = settings()) {
  */
 function shouldExport(identity) {
     const s = settings();
+    const existed = Boolean(s.counters?.[identity.key]);
     const counter = getCounter(identity.key);
-    const isFirstSeen = !counter.lastFloor && counter.exports === 0 && !counter.lastExportAt;
+    const interval = intervalValue(s);
+    const isFirstSeen = !existed || (!counter.initialized && !counter.lastFloor && counter.exports === 0 && !counter.lastExportAt);
 
     if (isFirstSeen) {
-        const interval = intervalValue(s);
         counter.lastFloor = Math.floor(identity.floor / interval) * interval;
         counter.name = identity.cardName;
+        counter.initialized = true;
         saveSettings();
         log(`初始化计数基线 key=${identity.key} floor=${identity.floor} → 基线 ${counter.lastFloor}`);
         return false;
     }
+    if (!counter.initialized) counter.initialized = true;
 
-    // 聊天被回退/删楼层：基线高于当前楼层时重置基线，避免永远触发或永远不触发
+    // 聊天被回退/删楼层：基线按间隔重新对齐到不高于当前楼层的倍数，避免后续备份点永久偏移
     if (identity.floor < counter.lastFloor) {
-        counter.lastFloor = identity.floor;
-        saveSettings();
+        const aligned = Math.floor(identity.floor / interval) * interval;
+        if (counter.lastFloor !== aligned) {
+            counter.lastFloor = aligned;
+            if ((counter.backfilledFloor ?? 0) > aligned) {
+                counter.backfilledFloor = aligned;
+            }
+            clearCounterRewriteMeta(counter);
+            saveSettings();
+            log(`检测到删楼回退，基线重对齐 key=${identity.key} floor=${identity.floor} → 基线 ${aligned}`);
+        }
         return false;
     }
 
-    return (identity.floor - counter.lastFloor) >= intervalValue(s);
+    return (identity.floor - counter.lastFloor) >= interval;
 }
 
 /**
@@ -417,7 +534,7 @@ function remainingFloors(identity) {
 }
 
 /* ------------------------------------------------------------------ *
- * 导出内容：服务端 /api/chats/export 优先，前端序列化回退
+ * 导出内容：本地直出 Blob / 服务端 /api/chats/export
  * ------------------------------------------------------------------ */
 
 async function fetchServerExport(format) {
@@ -473,37 +590,75 @@ function buildHeaderLine(identity) {
     });
 }
 
-/**
- * 序列化当前聊天。
- * @param {string} format jsonl | txt
- * @param {number|null} uptoFloor 截止的界面楼号（含该楼）。null = 整档。
- *   截断点 = 楼号 + 1；隐藏楼吞并量由「切片带隐藏楼」设置项控制（默认 0）。
- *   jsonl 会在首行补元数据表头，保证回导入后楼层号不偏移。
- */
-function serializeLocalChat(format, uptoFloor = null, identity = null) {
-    const context = ctx();
-    const all = Array.isArray(context.chat) ? context.chat : [];
-    let messages = all;
-    if (uptoFloor !== null) {
-        messages = all.slice(0, sliceEnd(all, uptoFloor).end);
-    }
-    if (format === 'txt') {
-        return messages
-            .filter((m) => !m?.is_system)
-            .map((m) => `${m?.name ?? '?'}: ${String(m?.extra?.display_text ?? m?.mes ?? '').replace(/\r?\n/g, '\n')}`)
-            .join('\n\n') + '\n';
-    }
-    const body = messages.map((m) => JSON.stringify(m)).join('\n');
-    const header = buildHeaderLine(identity ?? currentIdentity());
-    return `${header}\n${body}\n`;
+function formatTxtMessage(m) {
+    return `${m?.name ?? '?'}: ${String(m?.extra?.display_text ?? m?.mes ?? '').replace(/\r?\n/g, '\n')}`;
 }
 
-async function buildExportContent(format) {
+/**
+ * 分块序列化当前聊天（避免大聊天反复整串拼接导致内存峰值翻倍）。
+ * @param {string} format jsonl | txt
+ * @param {number|null} uptoFloor 截止的界面楼号（含该楼）。null = 整档。
+ */
+function serializeLocalChatParts(format, uptoFloor = null, identity = null) {
+    const context = ctx();
+    const all = Array.isArray(context.chat) ? context.chat : [];
+    const end = uptoFloor === null ? all.length : sliceEnd(all, uptoFloor).end;
+
+    if (format === 'txt') {
+        const parts = [];
+        let first = true;
+        for (let i = 0; i < end; i += 1) {
+            const m = all[i];
+            if (m?.is_system) continue;
+            if (!first) parts.push('\n\n');
+            parts.push(formatTxtMessage(m));
+            first = false;
+        }
+        parts.push('\n');
+        return parts;
+    }
+
+    const header = buildHeaderLine(identity ?? currentIdentity(false));
+    const parts = [header, '\n'];
+    if (end === 0) {
+        parts.push('\n');
+        return parts;
+    }
+    for (let i = 0; i < end; i += 1) {
+        parts.push(JSON.stringify(all[i]), '\n');
+    }
+    return parts;
+}
+
+/**
+ * 序列化当前聊天为单个字符串（保留兼容）。
+ */
+function serializeLocalChat(format, uptoFloor = null, identity = null) {
+    return serializeLocalChatParts(format, uptoFloor, identity).join('');
+}
+
+function partsToBlob(parts, format) {
+    const type = format === 'txt' ? 'text/plain;charset=utf-8' : 'application/jsonl;charset=utf-8';
+    return new Blob(parts, { type });
+}
+
+async function buildExportContent(format, { uptoFloor = null, identity = null } = {}) {
+    const s = settings();
+    const id = identity ?? currentIdentity(false);
+    const mustSlice = uptoFloor !== null;
+    const preferLocal = mustSlice || (s.exportSource === 'local' && format === 'jsonl');
+
+    if (preferLocal) {
+        const parts = serializeLocalChatParts(format, uptoFloor, id);
+        return { content: partsToBlob(parts, format), source: 'local-direct' };
+    }
+
     try {
         return { content: await fetchServerExport(format), source: 'server' };
     } catch (e) {
         log('服务端导出失败，回退本地序列化', e);
-        return { content: serializeLocalChat(format, null, currentIdentity()), source: 'local' };
+        const parts = serializeLocalChatParts(format, uptoFloor, id);
+        return { content: partsToBlob(parts, format), source: 'local-fallback' };
     }
 }
 
@@ -512,15 +667,24 @@ async function buildExportContent(format) {
  * ------------------------------------------------------------------ */
 
 function openDb() {
-    return new Promise((resolve, reject) => {
+    if (cachedDbPromise) return cachedDbPromise;
+    cachedDbPromise = new Promise((resolve, reject) => {
         const request = indexedDB.open(IDB_NAME, 1);
         request.onupgradeneeded = () => {
             const db = request.result;
             if (!db.objectStoreNames.contains(IDB_STORE)) db.createObjectStore(IDB_STORE);
         };
-        request.onsuccess = () => resolve(request.result);
-        request.onerror = () => reject(request.error);
+        request.onsuccess = () => {
+            const db = request.result;
+            db.onclose = () => { cachedDbPromise = null; };
+            resolve(db);
+        };
+        request.onerror = () => {
+            cachedDbPromise = null;
+            reject(request.error);
+        };
     });
+    return cachedDbPromise;
 }
 
 async function idbGet(key) {
@@ -580,23 +744,19 @@ async function pickBackupRoot() {
         return null;
     }
     const handle = await window.showDirectoryPicker({ id: MODULE_NAME, mode: 'readwrite' });
+    cachedRootHandle = handle;
     await idbSet(IDB_KEY_ROOT, handle);
     settings().rootName = handle.name || '已授权目录';
     saveSettings();
-    refreshPanel();
+    scheduleRefresh({ force: true });
     return handle;
 }
 
 async function getRootHandle() {
+    if (cachedRootHandle !== undefined) return cachedRootHandle;
     const handle = await idbGet(IDB_KEY_ROOT);
-    if (!handle) return null;
-    try {
-        const permission = await handle.queryPermission?.({ mode: 'readwrite' });
-        if (permission === 'granted') return handle;
-    } catch (e) {
-        log('queryPermission failed', e);
-    }
-    return handle; // 权限待确认，写入时再请求
+    cachedRootHandle = handle || null;
+    return cachedRootHandle;
 }
 
 async function ensurePermission(handle) {
@@ -613,32 +773,64 @@ async function ensurePermission(handle) {
     }
 }
 
-/**
- * 写入 <根目录>/<角色卡文件夹>/<文件名>
- * 不同角色卡的文件夹名不同，天然隔离。
- */
-async function writeViaFsa(handle, segments, fileName, content) {
-    if (!(await ensurePermission(handle))) throw new Error('FSA_PERMISSION_DENIED');
+async function resolveDirectory(handle, segments) {
     let dir = handle;
     for (const segment of segments) {
         dir = await dir.getDirectoryHandle(segment, { create: true });
     }
+    return dir;
+}
+
+async function listExistingFileNames(dir) {
+    const names = new Set();
+    if (typeof dir?.keys === 'function') {
+        for await (const name of dir.keys()) {
+            names.add(name);
+        }
+    }
+    return names;
+}
+
+/**
+ * 写入 <根目录>/<角色卡文件夹>/<文件名>
+ * 支持传入已解析的 dirHandle、existingNames（批量回溯免重复 IPC）与 overwriteExact（原地覆写）。
+ */
+async function writeViaFsa(handle, segments, fileName, content, options = {}) {
+    const {
+        dirHandle = null,
+        existingNames = null,
+        overwriteExact = false,
+        skipPermissionCheck = false,
+    } = options;
+
+    if (!skipPermissionCheck && !(await ensurePermission(handle))) {
+        throw new Error('FSA_PERMISSION_DENIED');
+    }
+
+    const dir = dirHandle || await resolveDirectory(handle, segments);
 
     let target = fileName;
-    if (settings().onConflict === 'suffix') {
+    if (!overwriteExact && settings().onConflict === 'suffix') {
         let index = 1;
-        // eslint-disable-next-line no-constant-condition
-        while (true) {
-            let exists = false;
-            try {
-                await dir.getFileHandle(target, { create: false });
-                exists = true;
-            } catch (e) {
-                exists = false;
+        if (existingNames instanceof Set) {
+            while (existingNames.has(target)) {
+                index += 1;
+                target = withSuffix(fileName, index);
             }
-            if (!exists) break;
-            index += 1;
-            target = withSuffix(fileName, index);
+        } else {
+            // eslint-disable-next-line no-constant-condition
+            while (true) {
+                let exists = false;
+                try {
+                    await dir.getFileHandle(target, { create: false });
+                    exists = true;
+                } catch (e) {
+                    exists = false;
+                }
+                if (!exists) break;
+                index += 1;
+                target = withSuffix(fileName, index);
+            }
         }
     }
 
@@ -646,6 +838,7 @@ async function writeViaFsa(handle, segments, fileName, content) {
     const writable = await fileHandle.createWritable();
     await writable.write(content);
     await writable.close();
+    if (existingNames instanceof Set) existingNames.add(target);
     return target;
 }
 
@@ -655,9 +848,9 @@ function withSuffix(fileName, index) {
     return `${fileName.slice(0, dot)} (${index})${fileName.slice(dot)}`;
 }
 
-function writeViaDownload(fileName, content, format) {
+function writeViaDownload(fileName, content, format, { revokeDelayMs = 1500 } = {}) {
     const type = format === 'txt' ? 'text/plain;charset=utf-8' : 'application/jsonl;charset=utf-8';
-    const blob = new Blob([content], { type });
+    const blob = content instanceof Blob ? content : new Blob([content], { type });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
@@ -666,16 +859,35 @@ function writeViaDownload(fileName, content, format) {
     document.body.appendChild(a);
     a.click();
     a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 5000);
+    setTimeout(() => URL.revokeObjectURL(url), revokeDelayMs);
     return fileName;
 }
 
 /* ------------------------------------------------------------------ *
- * 备份主流程
+ * 备份主流程 & 里程碑覆写/定稿
  * ------------------------------------------------------------------ */
 
-async function runBackup({ manual = false } = {}) {
+function cancelPendingRewrite() {
+    if (rewriteTimer) {
+        clearTimeout(rewriteTimer);
+        rewriteTimer = null;
+    }
+    if (uiState.rewritePending || rewritePendingKey) {
+        uiState.rewritePending = false;
+        rewritePendingKey = '';
+    }
+}
+
+async function runBackup({
+    manual = false,
+    targetFloor = null,
+    overwriteFile = null,
+    targetSegments = null,
+    formatOverride = null,
+    reasonLabel = '',
+} = {}) {
     if (busy) {
+        if (!manual && !overwriteFile) pendingRecheck = true;
         log('上一次备份尚未结束，跳过本次触发');
         return { ok: false, reason: 'busy' };
     }
@@ -684,13 +896,18 @@ async function runBackup({ manual = false } = {}) {
     syncBusyUI();
     try {
         const s = settings();
-        const identity = currentIdentity();
-        const format = s.format === 'txt' ? 'txt' : 'jsonl';
-        const dirFileName = buildFileName(identity, format, false);
-        const downloadName = buildFileName(identity, format, true);
-        const segments = backupPathSegments(identity);
+        const identity = currentIdentity(false);
+        const backupFloor = targetFloor !== null ? Number(targetFloor) : identity.floor;
+        const format = formatOverride || (s.format === 'txt' ? 'txt' : 'jsonl');
+        const dirFileName = overwriteFile || buildFileName(identity, format, false, backupFloor);
+        const downloadName = buildFileName(identity, format, true, backupFloor);
+        const segments = Array.isArray(targetSegments) ? targetSegments : backupPathSegments(identity);
+        const isRewrite = Boolean(overwriteFile);
 
-        const { content, source } = await buildExportContent(format);
+        const { content, source } = await buildExportContent(format, {
+            uptoFloor: targetFloor,
+            identity,
+        });
 
         let savedAs = downloadName;
         let mode = 'download';
@@ -699,36 +916,81 @@ async function runBackup({ manual = false } = {}) {
             const handle = await getRootHandle();
             if (handle) {
                 try {
-                    savedAs = await writeViaFsa(handle, segments, dirFileName, content);
+                    savedAs = await writeViaFsa(handle, segments, dirFileName, content, {
+                        overwriteExact: isRewrite,
+                    });
                     mode = 'fsa';
                 } catch (e) {
+                    if (isRewrite) {
+                        log('FSA 原地覆写失败，跳过回退下载以免重复弹窗', e);
+                        return { ok: false, reason: e?.message || String(e) };
+                    }
                     log('FSA 写入失败，回退浏览器下载', e);
                     savedAs = writeViaDownload(downloadName, content, format);
                     mode = 'download';
                 }
             } else {
+                if (isRewrite) return { ok: false, reason: 'no_handle' };
                 savedAs = writeViaDownload(downloadName, content, format);
-                mode = 'download';
             }
         } else {
+            if (isRewrite) return { ok: false, reason: 'not_fsa' };
             savedAs = writeViaDownload(downloadName, content, format);
         }
 
         const counter = getCounter(identity.key);
+        const messages = Array.isArray(ctx().chat) ? ctx().chat : [];
+        const watchIndex = resolveWatchIndex(messages, backupFloor, Number(s.floorOffset) || 0);
+        const watchFp = watchIndex >= 0 ? messageFingerprint(messages[watchIndex]) : '';
+
         counter.name = identity.cardName;
-        counter.lastFloor = identity.floor;
-        counter.exports = (counter.exports || 0) + 1;
+        counter.initialized = true;
+        if (!isRewrite) {
+            counter.lastFloor = backupFloor;
+            counter.exports = (counter.exports || 0) + 1;
+            if (!manual) {
+                const interval = intervalValue(s);
+                const aligned = Math.floor(backupFloor / interval) * interval;
+                const prevAligned = Math.max(0, aligned - interval);
+                if ((counter.backfilledFloor ?? 0) >= prevAligned && aligned > (counter.backfilledFloor ?? 0)) {
+                    counter.backfilledFloor = aligned;
+                }
+            }
+        }
         counter.lastExportAt = timestampSlug();
+
+        if (mode === 'fsa') {
+            counter.lastBackupFile = savedAs;
+            counter.lastBackupSegments = segments;
+            counter.lastBackupFormat = format;
+            counter.lastBackupFp = watchFp;
+            counter.lastBackupWatchIndex = watchIndex;
+        } else if (!isRewrite) {
+            clearCounterRewriteMeta(counter);
+        }
+
+        if (uiState.deferredKey === identity.key) {
+            uiState.deferredReason = '';
+            uiState.deferredKey = '';
+        }
+        if (rewritePendingKey === identity.key) {
+            uiState.rewritePending = false;
+            rewritePendingKey = '';
+        }
+
         saveSettings();
 
         const place = mode === 'fsa'
             ? [s.rootName || '备份根目录', ...segments].join('\\') + '\\'
             : '浏览器下载目录';
-        const message = `已备份 ${identity.cardName} 第 ${identity.floor} 楼 → ${place}${savedAs}${source === 'local' ? '（本地序列化回退）' : ''}`;
+        const sourceNote = source === 'local-fallback' ? '（本地序列化回退）' : '';
+        const message = isRewrite
+            ? `已更新第 ${backupFloor} 楼备份${reasonLabel ? `（${reasonLabel}）` : ''} → ${place}${savedAs}`
+            : `已备份 ${identity.cardName} 第 ${backupFloor} 楼 → ${place}${savedAs}${sourceNote}`;
         log(message);
         notify(manual ? `手动备份完成：${savedAs}` : message, 'success');
-        refreshPanel();
-        return { ok: true, mode, savedAs, identity };
+        scheduleRefresh({ force: true });
+        return { ok: true, mode, savedAs, identity, isRewrite };
     } catch (e) {
         console.error(`[${MODULE_NAME}] 备份失败`, e);
         notify(`备份失败：${e?.message || e}`, 'error');
@@ -737,15 +999,91 @@ async function runBackup({ manual = false } = {}) {
         busy = false;
         uiState.backingUp = false;
         syncBusyUI();
+        if (pendingRecheck) {
+            pendingRecheck = false;
+            setTimeout(() => onChatActivity('recheck'), 0);
+        }
     }
+}
+
+async function tryOverwriteMilestone(identity, counter, reasonLabel = '重生成更新') {
+    const s = settings();
+    if (!s.enabled || !s.updateLatestOnRewrite) return false;
+    if (s.writeMode !== 'fsa' || !fsaSupported()) return false;
+    if (!counter?.lastBackupFile || Number(counter.lastBackupWatchIndex ?? -1) < 0) return false;
+
+    const messages = Array.isArray(ctx().chat) ? ctx().chat : [];
+    const watchIdx = Number(counter.lastBackupWatchIndex);
+    const targetMsg = messages[watchIdx];
+    if (!targetMsg) return false;
+
+    // 切到新的空回或重生成空回时，绝不用空内容覆盖已存好的有效文件
+    if (s.skipEmptyReply && isMessageEmpty(targetMsg)) {
+        log(`第 ${counter.lastFloor} 楼当前内容为空，跳过原地覆写以保护已有备份`);
+        return false;
+    }
+
+    const newFp = messageFingerprint(targetMsg);
+    if (newFp === counter.lastBackupFp) return false;
+
+    const result = await runBackup({
+        manual: false,
+        targetFloor: counter.lastFloor,
+        overwriteFile: counter.lastBackupFile,
+        targetSegments: counter.lastBackupSegments,
+        formatOverride: counter.lastBackupFormat || undefined,
+        reasonLabel,
+    });
+    return Boolean(result?.ok);
+}
+
+function scheduleMilestoneRewrite(identity, reasonLabel = '重生成/Swipe 更新') {
+    const s = settings();
+    if (!s.enabled || !s.updateLatestOnRewrite || s.writeMode !== 'fsa' || !fsaSupported()) return;
+
+    const counter = peekCounter(identity.key);
+    if (!counter._exists || !counter.lastBackupFile || counter.lastFloor !== identity.floor) return;
+
+    const messages = Array.isArray(ctx().chat) ? ctx().chat : [];
+    const targetMsg = messages[counter.lastBackupWatchIndex];
+    if (!targetMsg) return;
+    if (s.skipEmptyReply && isMessageEmpty(targetMsg)) return;
+    if (messageFingerprint(targetMsg) === counter.lastBackupFp) return;
+
+    cancelPendingRewrite();
+    rewritePendingKey = identity.key;
+    uiState.rewritePending = true;
+    scheduleRefresh();
+
+    rewriteTimer = setTimeout(async () => {
+        rewriteTimer = null;
+        uiState.rewritePending = false;
+        rewritePendingKey = '';
+        try {
+            const cur = currentIdentity(false);
+            if (cur.key !== identity.key) return;
+            const liveCounter = getCounter(cur.key);
+            if (cur.floor !== liveCounter.lastFloor) return;
+            await tryOverwriteMilestone(cur, liveCounter, reasonLabel);
+        } catch (e) {
+            log('防抖覆写备份失败', e);
+        } finally {
+            scheduleRefresh();
+        }
+    }, REWRITE_DEBOUNCE_MS);
+}
+
+function yieldToMain() {
+    return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 /**
  * 回溯备份：按导出间隔把「已加载的历史楼层」逐段补齐。
- * 例：当前 438 楼、间隔 50、从未备份 → 导出 50 / 100 / 150 / … / 400 共 8 个文件。
- *
- * 说明：服务端 /api/chats/export 只能整档导出，无法切片，
- * 因此回溯一律使用前端 context.chat.slice(0, n) 序列化（字段与 jsonl 原文一致）。
+ * 优化：使用 O(N) 增量序列化与 Blob 分块写入，避免 O(K²·N) 重复序列化和主线程长阻塞。
  */
 async function runBackfill() {
     if (busy) {
@@ -756,7 +1094,7 @@ async function runBackfill() {
     const s = settings();
     let identity;
     try {
-        identity = currentIdentity();
+        identity = currentIdentity(false);
     } catch (e) {
         notify(`读取当前聊天失败：${e?.message || e}`, 'error');
         return { ok: false, reason: e?.message || String(e) };
@@ -778,60 +1116,123 @@ async function runBackfill() {
 
     busy = true;
     uiState.backfillProgress = { current: 0, total: floors.length };
-    syncBusyUI();
+    syncBusyUI(floors);
     const format = s.format === 'txt' ? 'txt' : 'jsonl';
     const pathSegments = backupPathSegments(identity);
+    const offset = Number(s.floorOffset) || 0;
+    const swallowCap = Math.max(0, Math.min(50, Number(s.swallowHidden) || 0));
+
     let handle = null;
-    if (s.writeMode === 'fsa' && fsaSupported()) handle = await getRootHandle();
+    let dirHandle = null;
+    let existingNames = null;
+    if (s.writeMode === 'fsa' && fsaSupported()) {
+        handle = await getRootHandle();
+        if (handle) {
+            if (await ensurePermission(handle)) {
+                try {
+                    dirHandle = await resolveDirectory(handle, pathSegments);
+                    if (s.onConflict === 'suffix') {
+                        existingNames = await listExistingFileNames(dirHandle);
+                    }
+                } catch (e) {
+                    log('回溯：预解析 FSA 目录失败，将回退下载', e);
+                    handle = null;
+                    dirHandle = null;
+                }
+            } else {
+                handle = null;
+            }
+        }
+    }
 
     let done = 0;
     let lastOk = Number(getCounter(identity.key).backfilledFloor ?? 0);
     const written = [];
 
+    // 增量序列化状态（每条消息仅序列化 1 次）
+    const headerLine = format === 'jsonl' ? buildHeaderLine(identity) : '';
+    const parts = format === 'jsonl' ? [headerLine, '\n'] : [];
+    let cachedEnd = 0;
+    let totalChars = headerLine ? headerLine.length + 1 : 0;
+    let txtHasItem = false;
+
     try {
-        for (const target of floors) {
+        for (let segIdx = 0; segIdx < floors.length; segIdx += 1) {
+            const target = floors[segIdx];
             uiState.backfillProgress = { current: done + 1, total: floors.length };
-            syncBusyUI();
+            syncBusyUI(floors);
             try {
-                // 切片导出（独立实现 + 硬校验）：
-                // 截止楼号 target（含），向后吞并紧随的隐藏楼；写入前校验行数，异常即拒绝写盘。
                 const all = Array.isArray(ctx().chat) ? ctx().chat : [];
-                const { end, swallowed } = sliceEnd(all, target);
-                if (end <= target) throw new Error(`切片越界：end=${end} ≤ target=${target}（共 ${all.length} 条）`);
-
-                let content;
-                if (format === 'txt') {
-                    content = all.slice(0, end)
-                        .filter((m) => !m?.is_system)
-                        .map((m) => `${m?.name ?? '?'}: ${String(m?.extra?.display_text ?? m?.mes ?? '').replace(/\r?\n/g, '\n')}`)
-                        .join('\n\n') + '\n';
-                } else {
-                    // 与酒馆原生导出结构一致：首行元数据表头 + 消息体，回导入后楼层号不偏移
-                    const body = all.slice(0, end).map((m) => JSON.stringify(m)).join('\n');
-                    content = `${buildHeaderLine(identity)}\n${body}\n`;
+                const { end } = sliceEnd(all, target, offset);
+                const expectedRaw = target - offset;
+                if (end <= expectedRaw) {
+                    throw new Error(`切片越界：end=${end} ≤ target=${expectedRaw}（共 ${all.length} 条）`);
                 }
 
-                // 硬校验：实际条数必须等于「目标楼 + 1 + 允许吞并的隐藏楼上限」
-                const actualLines = end;
-                const maxAllowed = target + 1 + Math.max(0, Math.min(50, Number(s.swallowHidden) || 0));
-                if (actualLines > maxAllowed) {
-                    throw new Error(`切片自检失败：目标 ${target} 楼，实际切出 ${actualLines} 条（上限 ${maxAllowed}，总 ${all.length} 条）— 拒绝写入`);
+                // 若中途发生删楼导致缓存长度超过本次终点，安全重置增量缓冲
+                if (cachedEnd > end) {
+                    parts.length = 0;
+                    if (format === 'jsonl') {
+                        parts.push(headerLine, '\n');
+                        totalChars = headerLine.length + 1;
+                    } else {
+                        totalChars = 0;
+                        txtHasItem = false;
+                    }
+                    cachedEnd = 0;
                 }
-                log(`回溯 ${target} 楼：切出 ${actualLines}/${all.length} 条，${content.length} 字符`);
+
+                const maxAllowed = expectedRaw + 1 + swallowCap;
+                if (end > maxAllowed) {
+                    throw new Error(`切片自检失败：目标 ${target} 楼，实际切出 ${end} 条（上限 ${maxAllowed}，总 ${all.length} 条）— 拒绝写入`);
+                }
+
+                for (let i = cachedEnd; i < end; i += 1) {
+                    const m = all[i];
+                    if (format === 'txt') {
+                        if (!m?.is_system) {
+                            const chunk = formatTxtMessage(m);
+                            if (txtHasItem) {
+                                parts.push('\n\n');
+                                totalChars += 2;
+                            }
+                            parts.push(chunk);
+                            totalChars += chunk.length;
+                            txtHasItem = true;
+                        }
+                    } else {
+                        const line = JSON.stringify(m);
+                        parts.push(line, '\n');
+                        totalChars += line.length + 1;
+                    }
+                    if ((i - cachedEnd + 1) % 100 === 0) {
+                        await yieldToMain();
+                    }
+                }
+                cachedEnd = end;
+
+                const blob = partsToBlob(format === 'txt' ? [...parts, '\n'] : parts, format);
+                log(`回溯 ${target} 楼：切出 ${end}/${all.length} 条，约 ${totalChars} 字符`);
 
                 const dirName = buildFileName(identity, format, false, target);
                 const dlName = buildFileName(identity, format, true, target);
 
                 let savedAs;
-                if (handle) {
+                if (handle && dirHandle) {
                     try {
-                        savedAs = await writeViaFsa(handle, pathSegments, dirName, content);
+                        savedAs = await writeViaFsa(handle, pathSegments, dirName, blob, {
+                            dirHandle,
+                            existingNames,
+                            skipPermissionCheck: true,
+                        });
                     } catch (e) {
                         log('回溯：FSA 写入失败，回退下载', e);
-                        savedAs = writeViaDownload(dlName, content, format);
+                        if (done > 0) await sleep(250);
+                        savedAs = writeViaDownload(dlName, blob, format, { revokeDelayMs: 1200 });
                     }
                 } else {
-                    savedAs = writeViaDownload(dlName, content, format);
+                    if (done > 0) await sleep(250);
+                    savedAs = writeViaDownload(dlName, blob, format, { revokeDelayMs: 1200 });
                 }
 
                 done += 1;
@@ -847,6 +1248,7 @@ async function runBackfill() {
 
         const counter = getCounter(identity.key);
         counter.name = identity.cardName;
+        counter.initialized = true;
         counter.backfilledFloor = lastOk;
         counter.exports = (counter.exports || 0) + done;
         if (done > 0) counter.lastExportAt = timestampSlug();
@@ -859,7 +1261,7 @@ async function runBackfill() {
                 : written.join(' / ');
             notify(`回溯备份完成：${done} 个文件（${preview} 楼）`, 'success');
         }
-        refreshPanel();
+        scheduleRefresh({ force: true });
         return { ok: true, done, lastOk };
     } catch (e) {
         console.error(`[${MODULE_NAME}] 回溯备份失败`, e);
@@ -879,27 +1281,121 @@ function markBackfilled(identity) {
     counter.backfilledFloor = Math.floor(identity.floor / interval) * interval;
     counter.name = identity.cardName;
     saveSettings();
-    refreshPanel();
+    scheduleRefresh({ force: true });
     notify(`已把「${identity.cardName}」的历史空档标记为已备份（至 ${counter.backfilledFloor} 楼）`, 'info');
 }
 
-async function onFloorAdvance(trigger) {
+function isTargetReplyEmpty(messages, identity, eventArg, offset) {
+    const idx = (typeof eventArg === 'number' && Number.isInteger(eventArg) && eventArg >= 0 && eventArg < messages.length && !messages[eventArg]?.is_system)
+        ? eventArg
+        : resolveWatchIndex(messages, identity.floor, offset);
+    if (idx < 0) return true;
+    return isMessageEmpty(messages[idx]);
+}
+
+async function finalizePreviousMilestoneIfNeeded(identity) {
+    const s = settings();
+    if (!s.enabled || !s.updateLatestOnRewrite || s.writeMode !== 'fsa' || !fsaSupported()) return;
+    const peek = peekCounter(identity.key);
+    if (!peek._exists || !peek.lastBackupFile || peek.lastBackupWatchIndex < 0) return;
+    if (identity.floor <= peek.lastFloor) return;
+
+    const messages = Array.isArray(ctx().chat) ? ctx().chat : [];
+    const prevMsg = messages[peek.lastBackupWatchIndex];
+    if (!prevMsg) return;
+    if (s.skipEmptyReply && isMessageEmpty(prevMsg)) return;
+    if (messageFingerprint(prevMsg) === peek.lastBackupFp) return;
+
+    cancelPendingRewrite();
+    log(`检测到推进至 #${identity.floor} 楼时，上一里程碑 #${peek.lastFloor} 楼内容有变动，立即切片定稿`);
+    await tryOverwriteMilestone(identity, getCounter(identity.key), '进入下楼前定稿');
+}
+
+async function onChatActivity(trigger, eventArg = null) {
     try {
         const s = settings();
         if (!s.enabled) return;
-        if (s.countMode === 'ai' && trigger !== 'ai') return;
 
-        const identity = currentIdentity();
+        const identity = currentIdentity(false);
+        if (!hasActiveChat(identity)) return;
 
+        const messages = Array.isArray(ctx().chat) ? ctx().chat : [];
+        const offset = Number(s.floorOffset) || 0;
+        const counterPeek = peekCounter(identity.key);
+
+        // 1. 方案 B：已推进到后续楼层时，先检查上一里程碑在离开前是否有未落盘的重生成/Swipe 定稿
+        if (trigger !== 'delete' && counterPeek._exists && identity.floor > counterPeek.lastFloor) {
+            await finalizePreviousMilestoneIfNeeded(identity);
+        }
+
+        // 2. 停留在刚备份过的里程碑楼层发生重生成/Swipe/编辑：安排防抖原地覆写（仅 FSA 模式）
+        if (
+            (trigger === 'ai' || trigger === 'swipe' || trigger === 'edit')
+            && counterPeek._exists
+            && identity.floor === counterPeek.lastFloor
+            && counterPeek.lastBackupFile
+        ) {
+            const labelMap = { ai: '重生成更新', swipe: 'Swipe 切换更新', edit: '编辑内容更新' };
+            scheduleMilestoneRewrite(identity, labelMap[trigger] || '更新');
+        }
+
+        // 3. 删楼事件：仅同步对齐回退基线，不触发导出
+        if (trigger === 'delete') {
+            cancelPendingRewrite();
+            shouldExport(identity);
+            if (uiState.deferredKey === identity.key) {
+                uiState.deferredReason = '';
+                uiState.deferredKey = '';
+            }
+            scheduleRefresh();
+            return;
+        }
+
+        // 4. 仅 AI 计数模式过滤（保留 swipe 对 AI 楼的补备能力，以及编辑非用户消息的补备能力）
+        if (s.countMode === 'ai' && trigger !== 'ai' && trigger !== 'recheck') {
+            if (trigger === 'swipe') {
+                const msg = (typeof eventArg === 'number' && messages[eventArg]) ? messages[eventArg] : messages[messages.length - 1];
+                if (msg?.is_user) {
+                    scheduleRefresh();
+                    return;
+                }
+            } else if (trigger === 'edit') {
+                const msg = (typeof eventArg === 'number' && messages[eventArg]) ? messages[eventArg] : null;
+                if (!msg || msg.is_user) {
+                    scheduleRefresh();
+                    return;
+                }
+            } else {
+                scheduleRefresh();
+                return;
+            }
+        }
+
+        // 5. 常规里程碑触发判定（含空回拦截：空消息不导出且不推进 lastFloor）
         if (shouldExport(identity)) {
+            if (s.skipEmptyReply && isTargetReplyEmpty(messages, identity, eventArg, offset)) {
+                uiState.deferredKey = identity.key;
+                uiState.deferredReason = `#${identity.floor} 楼内容为空，已延后备份`;
+                log(`空回拦截：key=${identity.key} floor=${identity.floor} 为空，跳过本次导出并保留基线`);
+                scheduleRefresh();
+                return;
+            }
             log(`触发自动备份 key=${identity.key} floor=${identity.floor} interval=${s.interval}`);
             await runBackup();
         } else {
-            refreshPanel();
+            if (uiState.deferredKey === identity.key && !isTargetReplyEmpty(messages, identity, eventArg, offset)) {
+                uiState.deferredReason = '';
+                uiState.deferredKey = '';
+            }
+            scheduleRefresh();
         }
     } catch (e) {
         console.error(`[${MODULE_NAME}] 楼层计数处理失败`, e);
     }
+}
+
+async function onFloorAdvance(trigger, eventArg = null) {
+    return onChatActivity(trigger, eventArg);
 }
 
 /* ------------------------------------------------------------------ *
@@ -980,6 +1476,16 @@ function switchTab(tabName) {
     for (const panel of root.querySelectorAll('.cab-tab-panel')) {
         panel.classList.toggle('is-active', panel.dataset.tab === tabName);
     }
+    if (isDrawerOpen()) {
+        refreshPanel({ onlyTab: tabName, forceRender: true });
+    } else {
+        panelDirty = true;
+    }
+}
+
+function isDrawerOpen() {
+    const drawer = document.querySelector('#chat_autobackup_container .inline-drawer');
+    return Boolean(drawer?.classList.contains('open'));
 }
 
 function buildPanel() {
@@ -1017,10 +1523,16 @@ function buildPanel() {
     container.append(drawer);
     host.append(container);
 
-    header.addEventListener('click', () => drawer.classList.toggle('open'));
+    header.addEventListener('click', () => {
+        const opened = drawer.classList.toggle('open');
+        if (opened && panelDirty) {
+            panelDirty = false;
+            refreshPanel({ forceRender: true });
+        }
+    });
 
     renderControls(content);
-    refreshPanel();
+    refreshPanel({ forceRender: true });
 }
 
 function buildSettingsRuleCard(s) {
@@ -1080,6 +1592,18 @@ function buildSettingsRuleCard(s) {
     }));
     card.append(fmt.field, el('div', 'cab-divider'));
 
+    // 导出数据源
+    const srcField = makeField('数据源（JSONL）', '本地直出直接读内存零拷贝写盘，大聊天极快（TXT 仍走服务端）');
+    srcField.field.append(makeSegment('cab_source_seg', [
+        ['local', '本地直出（极速）'],
+        ['server', '服务端导出'],
+    ], s.exportSource, (val) => {
+        settings().exportSource = val;
+        saveSettings();
+        refreshPanel({ forceRender: true });
+    }));
+    card.append(srcField.field, el('div', 'cab-divider'));
+
     // 计数方式
     const cnt = makeField('计数方式', '全部楼层：用户与 AI 各算一楼；仅 AI：一轮算一楼');
     cnt.field.append(makeSegment('cab_count_seg', [
@@ -1088,9 +1612,37 @@ function buildSettingsRuleCard(s) {
     ], s.countMode, (val) => {
         settings().countMode = val;
         saveSettings();
-        refreshPanel();
+        refreshPanel({ forceRender: true });
     }));
     card.append(cnt.field, el('div', 'cab-divider'));
+
+    // 空回拦截
+    const emptyRow = el('div', 'cab-field-row');
+    const emptyLabel = el('div', 'cab-field-label');
+    emptyLabel.append(
+        el('span', 'cab-field-title', '空回拦截'),
+        el('span', 'cab-field-hint', '最新楼为空白或空标签时延后备份，等重新生成有效内容后再导'),
+    );
+    const emptySw = makeSwitch('cab_skip_empty_switch', s.skipEmptyReply, (checked) => {
+        settings().skipEmptyReply = checked;
+        saveSettings();
+    });
+    emptyRow.append(emptyLabel, emptySw.wrap);
+    card.append(emptyRow, el('div', 'cab-divider'));
+
+    // 重生成/Swipe 自动更新
+    const rewriteRow = el('div', 'cab-field-row');
+    const rewriteLabel = el('div', 'cab-field-label');
+    rewriteLabel.append(
+        el('span', 'cab-field-title', '重生成 / Swipe 自动更新'),
+        el('span', 'cab-field-hint', '授权目录模式下停留在刚备份楼层重写时，防抖原地覆写（进入下楼兜底定稿）'),
+    );
+    const rewriteSw = makeSwitch('cab_rewrite_switch', s.updateLatestOnRewrite, (checked) => {
+        settings().updateLatestOnRewrite = checked;
+        saveSettings();
+    });
+    rewriteRow.append(rewriteLabel, rewriteSw.wrap);
+    card.append(rewriteRow, el('div', 'cab-divider'));
 
     // 导出后提示
     const toastRow = el('div', 'cab-field-row');
@@ -1158,9 +1710,10 @@ function buildSettingsStorageCard(s) {
     clearBtn.append(faIcon('fa-solid fa-link-slash'), el('span', '', '清除授权'));
     clearBtn.addEventListener('click', async () => {
         await idbDelete(IDB_KEY_ROOT);
+        cachedRootHandle = null;
         settings().rootName = '';
         saveSettings();
-        refreshPanel();
+        refreshPanel({ forceRender: true });
         notify('已清除目录授权，将回退为浏览器下载', 'info');
     });
     dirActions.append(pickBtn, clearBtn);
@@ -1384,8 +1937,13 @@ function buildOverviewTab() {
     resetBtn.append(faIcon('fa-solid fa-rotate-left'), el('span', '', '重置计数'));
     resetBtn.addEventListener('click', () => {
         try {
-            const identity = currentIdentity();
+            const identity = currentIdentity(false);
             if (!hasActiveChat(identity)) return;
+            cancelPendingRewrite();
+            if (uiState.deferredKey === identity.key) {
+                uiState.deferredReason = '';
+                uiState.deferredKey = '';
+            }
             const s2 = settings();
             s2.counters[identity.key] = {
                 name: identity.cardName,
@@ -1393,9 +1951,15 @@ function buildOverviewTab() {
                 backfilledFloor: s2.counters[identity.key]?.backfilledFloor ?? 0,
                 exports: s2.counters[identity.key]?.exports ?? 0,
                 lastExportAt: s2.counters[identity.key]?.lastExportAt ?? '',
+                initialized: true,
+                lastBackupFile: '',
+                lastBackupFp: '',
+                lastBackupWatchIndex: -1,
+                lastBackupFormat: '',
+                lastBackupSegments: [],
             };
             saveSettings();
-            refreshPanel();
+            refreshPanel({ forceRender: true });
             notify(`已把「${identity.cardName}」的计数基线重置为当前 #${identity.floor} 楼`, 'success');
         } catch (e) {
             console.error(`[${MODULE_NAME}] 重置计数失败`, e);
@@ -1443,13 +2007,29 @@ function buildRecordsTab() {
     searchInput.addEventListener('input', () => {
         uiState.searchQuery = searchInput.value.trim();
         clearBtn.classList.toggle('cab-is-hidden', !uiState.searchQuery);
-        refreshPanel();
+        if (searchDebounceTimer) clearTimeout(searchDebounceTimer);
+        searchDebounceTimer = setTimeout(() => {
+            searchDebounceTimer = null;
+            try {
+                renderRecords(settings(), currentIdentity(false));
+            } catch (e) {
+                log('搜索过滤失败', e);
+            }
+        }, 150);
     });
     clearBtn.addEventListener('click', () => {
+        if (searchDebounceTimer) {
+            clearTimeout(searchDebounceTimer);
+            searchDebounceTimer = null;
+        }
         searchInput.value = '';
         uiState.searchQuery = '';
         clearBtn.classList.add('cab-is-hidden');
-        refreshPanel();
+        try {
+            renderRecords(settings(), currentIdentity(false));
+        } catch (e) {
+            log('清空搜索刷新失败', e);
+        }
         searchInput.focus();
     });
     searchWrap.append(searchInput, clearBtn);
@@ -1470,13 +2050,25 @@ function buildRecordsTab() {
             if (!counter || (counter.exports === 0 && !counter.lastExportAt)) delete s2.counters[key];
         }
         saveSettings();
-        refreshPanel();
+        refreshPanel({ forceRender: true });
         notify(`已清理 ${before - Object.keys(s2.counters).length} 条从未导出过的无效记录`, 'info');
     });
     bar.append(summary, pruneBtn);
 
     const listWrap = el('div', 'cab-record-list');
     listWrap.id = 'cab_counters';
+    listWrap.addEventListener('click', (ev) => {
+        const btn = ev.target?.closest?.('.cab-record-del');
+        if (!btn) return;
+        const key = btn.dataset.key;
+        if (!key) return;
+        const s2 = settings();
+        const cardName = s2.counters[key]?.name || '(未命名角色卡)';
+        delete s2.counters[key];
+        saveSettings();
+        refreshPanel({ forceRender: true });
+        notify(`已移除「${cardName}」的计数记录`, 'info');
+    });
 
     panel.append(searchWrap, bar, listWrap);
     return panel;
@@ -1555,16 +2147,21 @@ function renderControls(root) {
     root.append(buildOverviewTab(), settingsPanel, buildRecordsTab());
 }
 
-function syncTopbarAndSettings(s, identity) {
+function syncHeaderDot(s) {
     const interval = intervalValue(s);
     const fmtUpper = (s.format === 'txt' ? 'TXT' : 'JSONL');
-
-    // 抽屉标题状态点
     const dot = document.getElementById('cab_header_dot');
     if (dot) {
         dot.classList.toggle('is-paused', !s.enabled);
         dot.title = s.enabled ? `自动备份运行中（每 ${interval} 楼 · ${fmtUpper}）` : '自动备份已暂停';
     }
+}
+
+function syncTopbarAndSettings(s, identity, { syncSettingsTab = true } = {}) {
+    const interval = intervalValue(s);
+    const fmtUpper = (s.format === 'txt' ? 'TXT' : 'JSONL');
+
+    syncHeaderDot(s);
 
     // 顶部总开关与副标题
     const masterToggle = document.getElementById('cab_master_toggle');
@@ -1600,6 +2197,8 @@ function syncTopbarAndSettings(s, identity) {
         }
     }
 
+    if (!syncSettingsTab) return;
+
     // 同步设置页控件状态
     const intervalInput = document.getElementById('cab_interval_input');
     if (intervalInput && document.activeElement !== intervalInput) intervalInput.value = String(interval);
@@ -1610,10 +2209,15 @@ function syncTopbarAndSettings(s, identity) {
         }
     }
     setSegmentValue('cab_format_seg', s.format);
+    setSegmentValue('cab_source_seg', s.exportSource);
     setSegmentValue('cab_count_seg', s.countMode);
     setSegmentValue('cab_write_seg', s.writeMode);
     setSegmentValue('cab_conflict_seg', s.onConflict);
 
+    const skipEmptySw = document.getElementById('cab_skip_empty_switch');
+    if (skipEmptySw) skipEmptySw.checked = Boolean(s.skipEmptyReply);
+    const rewriteSw = document.getElementById('cab_rewrite_switch');
+    if (rewriteSw) rewriteSw.checked = Boolean(s.updateLatestOnRewrite);
     const toastSw = document.getElementById('cab_toast_switch');
     if (toastSw) toastSw.checked = Boolean(s.toast);
     const dlSw = document.getElementById('cab_dl_include_switch');
@@ -1760,11 +2364,21 @@ function renderOverview(s, identity, pending) {
         el('span', 'cab-floor-num', `#${identity.floor}`),
         el('span', 'cab-floor-unit', `当前楼层 · 共 ${identity.total ?? 0} 条${identity.hidden ? `（${identity.hidden} 隐藏）` : ''}`),
     );
+    const isDeferred = uiState.deferredKey === identity.key && Boolean(uiState.deferredReason);
+    const isRewritePending = uiState.rewritePending && rewritePendingKey === identity.key;
+    let nextText = '自动备份已暂停';
+    if (s.enabled) {
+        if (isDeferred) nextText = '空回已延后（等待重生成）';
+        else if (isRewritePending) nextText = '检测到重写 · 即将更新';
+        else if (remain === 0) nextText = '即将自动导出';
+        else nextText = `距下次还差 ${remain} 楼`;
+    }
     const nextPill = el(
         'span',
         'cab-next-pill' + (s.enabled ? '' : ' is-paused'),
-        s.enabled ? (remain === 0 ? '即将自动导出' : `距下次还差 ${remain} 楼`) : '自动备份已暂停',
+        nextText,
     );
+    if (isDeferred) nextPill.title = uiState.deferredReason;
     floorRow.append(floorMain, nextPill);
 
     const track = el('div', 'cab-progress-track');
@@ -1837,9 +2451,13 @@ function renderOverview(s, identity, pending) {
         techKv.textContent = '';
         const kvs = [
             ['导出文件名预览', previewFile],
+            ['当前数据源', (s.exportSource === 'local' && format === 'jsonl') ? '本地直出 Blob（零网络拷贝）' : '服务端 /api/chats/export（失败回退本地）'],
             ['楼层口径明细', `界面 #${identity.floor}（0 起） / 总消息 ${identity.total ?? 0} 条 / 隐藏楼 ${identity.hidden ?? 0} 条 / 校准偏移 ${Number(s.floorOffset) || 0}`],
             ['当前计数键 (Key)', identity.key],
         ];
+        if (counter.lastBackupFile) {
+            kvs.push(['最近锚定文件', `${counter.lastBackupFile}（#${counter.lastFloor} 楼）`]);
+        }
         for (const [k, v] of kvs) {
             const item = el('div', 'cab-kv-item');
             item.append(el('span', 'cab-kv-key', k), el('span', 'cab-kv-val', v));
@@ -1922,20 +2540,22 @@ function renderRecords(s, identity) {
         return;
     }
 
+    const nowParts = getNowDateParts();
+    const frag = document.createDocumentFragment();
     for (const [key, counter] of filtered) {
         const isCurrent = key === identity?.key;
         const isGroup = String(key).startsWith('group:');
         const cardName = counter?.name || '(未命名角色卡)';
         const rawChatId = String(key).split(':').slice(2).join(':');
         const session = formatChatSession(rawChatId, cardName);
-        const timeInfo = formatReadableTime(counter?.lastExportAt, { compact: true });
+        const timeInfo = formatReadableTime(counter?.lastExportAt, { compact: true, nowParts });
         const exportsCount = Number(counter?.exports ?? 0);
         const lastFloor = Number(counter?.lastFloor ?? 0);
         const backfilled = Number(counter?.backfilledFloor ?? 0);
 
         const item = el('div', 'cab-record-item' + (isCurrent ? ' is-active' : ''));
 
-        // 第一行：角色卡名 + 标签 + 删除图标按钮
+        // 第一行：角色卡名 + 标签 + 删除图标按钮（由容器事件委托处理点击）
         const top = el('div', 'cab-record-top');
         const titleWrap = el('div', 'cab-record-title-wrap');
         const nameEl = el('span', 'cab-record-name', cardName);
@@ -1946,15 +2566,10 @@ function renderRecords(s, identity) {
 
         const delBtn = document.createElement('button');
         delBtn.type = 'button';
-        delBtn.className = 'cab-btn cab-btn-icon';
+        delBtn.className = 'cab-btn cab-btn-icon cab-record-del';
+        delBtn.dataset.key = key;
         delBtn.title = '移除此条计数记录（不会删除已保存的文件）';
         delBtn.append(faIcon('fa-solid fa-trash-can'));
-        delBtn.addEventListener('click', () => {
-            delete settings().counters[key];
-            saveSettings();
-            refreshPanel();
-            notify(`已移除「${cardName}」的计数记录`, 'info');
-        });
         top.append(titleWrap, delBtn);
 
         // 第二行：美化后的会话信息
@@ -1977,8 +2592,9 @@ function renderRecords(s, identity) {
         meta.append(stats, timeEl);
 
         item.append(top, sessRow, meta);
-        countersBox.append(item);
+        frag.append(item);
     }
+    countersBox.append(frag);
 }
 
 function syncBusyUI(pending = null) {
@@ -1990,7 +2606,7 @@ function syncBusyUI(pending = null) {
     let segs = pending;
     if (segs === null) {
         try {
-            segs = pendingSegments(currentIdentity(), settings());
+            segs = pendingSegments(currentIdentity(false), settings());
         } catch (e) {
             segs = [];
         }
@@ -2029,23 +2645,65 @@ function syncBusyUI(pending = null) {
     if (resetBtn) resetBtn.disabled = busy;
 }
 
-function refreshPanel() {
+function scheduleRefresh({ force = false, tab = null } = {}) {
+    if (!document.getElementById('chat_autobackup_container')) return;
+    if (force) panelDirty = true;
+    if (!isDrawerOpen()) {
+        try {
+            syncHeaderDot(settings());
+        } catch (e) {
+            // 忽略未就绪时的圆点更新错误
+        }
+        panelDirty = true;
+        return;
+    }
+    if (refreshRafId) return;
+    const raf = typeof window.requestAnimationFrame === 'function'
+        ? window.requestAnimationFrame.bind(window)
+        : (fn) => setTimeout(fn, 16);
+    refreshRafId = raf(() => {
+        refreshRafId = 0;
+        refreshPanel({ onlyTab: tab, forceRender: true });
+    });
+}
+
+function refreshPanel({ onlyTab = null, forceRender = false } = {}) {
     if (!document.getElementById('chat_autobackup_container')) return;
 
     let s;
-    let identity;
     try {
         s = settings();
-        identity = currentIdentity();
     } catch (e) {
         return;
     }
 
-    const pending = hasActiveChat(identity) ? pendingSegments(identity, s) : [];
-    syncTopbarAndSettings(s, identity);
-    renderOverview(s, identity, pending);
-    renderRecords(s, identity);
-    syncBusyUI(pending);
+    syncHeaderDot(s);
+    if (!forceRender && !isDrawerOpen()) {
+        panelDirty = true;
+        return;
+    }
+
+    const activeTab = onlyTab || uiState.activeTab;
+    let identity;
+    try {
+        identity = currentIdentity(activeTab === 'overview');
+    } catch (e) {
+        return;
+    }
+
+    syncTopbarAndSettings(s, identity, { syncSettingsTab: activeTab === 'settings' || forceRender });
+
+    const badge = document.getElementById('cab_records_badge');
+    if (badge) badge.textContent = String(Object.keys(s.counters || {}).length);
+
+    if (activeTab === 'overview') {
+        const pending = hasActiveChat(identity) ? pendingSegments(identity, s) : [];
+        renderOverview(s, identity, pending);
+        syncBusyUI(pending);
+    } else if (activeTab === 'records') {
+        renderRecords(s, identity);
+    }
+    panelDirty = false;
 }
 
 /* ------------------------------------------------------------------ *
@@ -2056,11 +2714,25 @@ function registerEvents() {
     const context = ctx();
     const { eventSource, eventTypes } = context;
 
-    eventSource.on(eventTypes.MESSAGE_RECEIVED, () => onFloorAdvance('ai'));
-    eventSource.on(eventTypes.MESSAGE_SENT, () => onFloorAdvance('user'));
-    eventSource.on(eventTypes.CHAT_CHANGED, () => refreshPanel());
-    eventSource.on(eventTypes.SETTINGS_UPDATED, () => refreshPanel());
-    log('事件已注册：MESSAGE_RECEIVED / MESSAGE_SENT / CHAT_CHANGED');
+    eventSource.on(eventTypes.MESSAGE_RECEIVED, (msgId) => onChatActivity('ai', msgId));
+    eventSource.on(eventTypes.MESSAGE_SENT, (msgId) => onChatActivity('user', msgId));
+    if (eventTypes.MESSAGE_SWIPED) {
+        eventSource.on(eventTypes.MESSAGE_SWIPED, (msgId) => onChatActivity('swipe', msgId));
+    }
+    if (eventTypes.MESSAGE_EDITED) {
+        eventSource.on(eventTypes.MESSAGE_EDITED, (msgId) => onChatActivity('edit', msgId));
+    }
+    if (eventTypes.MESSAGE_DELETED) {
+        eventSource.on(eventTypes.MESSAGE_DELETED, (msgId) => onChatActivity('delete', msgId));
+    }
+    eventSource.on(eventTypes.CHAT_CHANGED, () => {
+        cancelPendingRewrite();
+        uiState.deferredReason = '';
+        uiState.deferredKey = '';
+        scheduleRefresh();
+    });
+    eventSource.on(eventTypes.SETTINGS_UPDATED, () => scheduleRefresh());
+    log('事件已注册：MESSAGE_RECEIVED / MESSAGE_SENT / MESSAGE_SWIPED / MESSAGE_EDITED / MESSAGE_DELETED / CHAT_CHANGED');
 }
 
 function registerSlashCommand() {
@@ -2117,4 +2789,14 @@ function onReady() {
 })();
 
 // 供调试使用
-window.chatAutoBackup = { runBackup, refreshPanel, settings, currentIdentity };
+window.chatAutoBackup = {
+    runBackup,
+    runBackfill,
+    refreshPanel,
+    scheduleRefresh,
+    settings,
+    currentIdentity,
+    onChatActivity,
+    isMessageEmpty,
+    messageFingerprint,
+};

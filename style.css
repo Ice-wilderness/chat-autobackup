@@ -1141,6 +1141,8 @@
     flex-direction: column;
     gap: 5px;
     transition: border-color 0.15s ease, background 0.15s ease;
+    content-visibility: auto;
+    contain-intrinsic-size: 0 96px;
 }
 
 #chat_autobackup_container .cab-record-item:hover {
