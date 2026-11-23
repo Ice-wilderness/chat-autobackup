@@ -27,7 +27,7 @@
  */
 
 const MODULE_NAME = 'chat-autobackup';
-const EXT_VERSION = '1.3.0';
+const EXT_VERSION = '1.3.1';
 const IDB_NAME = 'chat-autobackup';
 const IDB_STORE = 'handles';
 const IDB_KEY_ROOT = 'backupRoot';
@@ -42,7 +42,7 @@ const DEFAULT_SETTINGS = Object.freeze({
     rollingLimit: 10,       // 高频备份时，每个聊天在当前授权目录保留的普通备份份数
     format: 'jsonl',        // jsonl | txt
     exportSource: 'local',  // local = 本地直出 Blob（更快，支持精确切片）；server = /api/chats/export
-    countMode: 'all',       // all = 用户楼+AI楼都计数；ai = 只在 AI 出楼层后计数
+    countMode: 'all',       // all = 用户楼+AI楼都计数；ai = 只按非开场白 AI 回复轮次计数
     skipEmptyReply: true,   // 空回拦截：最新楼为空白或空思维链外壳时延后备份
     updateLatestOnRewrite: true, // 在 FSA 模式下重生成/Swipe/编辑当前里程碑楼层时自动原地覆写更新
     writeMode: 'fsa',       // fsa = 写入授权目录（按卡分文件夹）；download = 浏览器下载
@@ -182,6 +182,38 @@ function countHidden(messages) {
     let n = 0;
     for (const m of messages) if (m?.is_system) n += 1;
     return n;
+}
+
+function isAiMessage(msg) {
+    return Boolean(msg && !msg.is_user && !msg.is_system);
+}
+
+/**
+ * 构建 AI 轮次映射（仅 AI 模式用）：
+ * 索引 0 为开场白时不计入轮次（作第 0 轮基点）；之后每条非隐藏 AI 回复依次为第 1, 2, 3... 轮。
+ */
+function buildAiFloorMap(messages, offset = Number(settings().floorOffset) || 0) {
+    const list = Array.isArray(messages) ? messages : [];
+    const baseFloor = Math.max(0, offset);
+    const turnToFloor = [baseFloor];
+    const prefixTurns = new Int32Array(list.length);
+    let turns = 0;
+
+    for (let i = 0; i < list.length; i += 1) {
+        if (i > 0 && isAiMessage(list[i])) {
+            turns += 1;
+            turnToFloor.push(Math.max(0, i + offset));
+        }
+        prefixTurns[i] = turns;
+    }
+
+    const floorToTurn = (floor) => {
+        if (!list.length) return 0;
+        const raw = Math.min(list.length - 1, Math.floor(Number(floor) - offset));
+        return raw < 0 ? 0 : prefixTurns[raw];
+    };
+
+    return { totalTurns: turns, turnToFloor, floorToTurn };
 }
 
 /** 剥离纯空白思维链空壳与 HTML 注释，判断消息是否属于“空回”。 */
@@ -482,6 +514,43 @@ function shouldExport(identity, floorAdvanced = false) {
     const interval = intervalValue(s);
     const isFirstSeen = !existed || (!counter.initialized && !counter.lastFloor && counter.exports === 0 && !counter.lastExportAt);
 
+    if (s.countMode === 'ai') {
+        const messages = Array.isArray(ctx().chat) ? ctx().chat : [];
+        const aiMap = buildAiFloorMap(messages, Number(s.floorOffset) || 0);
+
+        if (isFirstSeen) {
+            const startTurn = interval < PERMANENT_INTERVAL && floorAdvanced
+                ? Math.max(0, aiMap.totalTurns - 1)
+                : aiMap.totalTurns;
+            const alignedTurn = alignedFloor(startTurn, interval);
+            counter.lastFloor = aiMap.turnToFloor[alignedTurn] ?? 0;
+            counter.name = identity.cardName;
+            counter.initialized = true;
+            saveSettings();
+            log(`初始化计数基线 key=${identity.key} floor=${identity.floor}（AI 第 ${aiMap.totalTurns} 轮） → 基线 #${counter.lastFloor}（第 ${alignedTurn} 轮）`);
+            return nextBackupFloor(alignedTurn, interval) <= aiMap.totalTurns;
+        }
+        if (!counter.initialized) counter.initialized = true;
+
+        if (identity.floor < counter.lastFloor) {
+            const alignedTurn = alignedFloor(aiMap.totalTurns, interval);
+            const aligned = aiMap.turnToFloor[alignedTurn] ?? 0;
+            if (counter.lastFloor !== aligned) {
+                counter.lastFloor = aligned;
+                if ((counter.backfilledFloor ?? 0) > aligned) {
+                    counter.backfilledFloor = aligned;
+                }
+                clearCounterRewriteMeta(counter);
+                saveSettings();
+                log(`检测到删楼回退，基线重对齐 key=${identity.key} floor=${identity.floor}（AI 第 ${aiMap.totalTurns} 轮） → 基线 #${aligned}`);
+            }
+            return false;
+        }
+
+        const baseTurn = aiMap.floorToTurn(counter.lastFloor);
+        return nextBackupFloor(baseTurn, interval) <= aiMap.totalTurns;
+    }
+
     if (isFirstSeen) {
         const start = interval < PERMANENT_INTERVAL && floorAdvanced ? Math.max(0, identity.floor - 1) : identity.floor;
         counter.lastFloor = alignedFloor(start, interval);
@@ -512,15 +581,28 @@ function shouldExport(identity, floorAdvanced = false) {
 }
 
 /**
- * 待回溯的历史段落：从「已回溯楼层」往上一个间隔开始，到「当前楼层向下取整的间隔倍数」为止。
- * 例：当前 438 楼、间隔 50、从未回溯 → [50, 100, 150, 200, 250, 300, 350, 400]
- * 例：已回溯到 300 楼、当前 438 楼 → [350, 400]
+ * 待回溯的历史段落：按当前计数方式（全部楼层 或 仅 AI 轮次）生成截止界面楼号列表。
  */
 function pendingSegments(identity, s = settings()) {
     const interval = intervalValue(s);
     const counter = peekCounter(identity.key);
     const base = Number(counter.backfilledFloor ?? 0);
     const segments = [];
+
+    if (s.countMode === 'ai') {
+        const messages = Array.isArray(ctx().chat) ? ctx().chat : [];
+        const aiMap = buildAiFloorMap(messages, Number(s.floorOffset) || 0);
+        const baseTurn = aiMap.floorToTurn(base);
+        for (let targetTurn = nextBackupFloor(alignedFloor(baseTurn, interval), interval);
+            targetTurn <= aiMap.totalTurns; targetTurn = nextBackupFloor(targetTurn, interval)) {
+            const targetFloor = aiMap.turnToFloor[targetTurn];
+            if (targetFloor !== undefined && targetFloor > base) {
+                segments.push(targetFloor);
+            }
+        }
+        return segments;
+    }
+
     for (let target = nextBackupFloor(alignedFloor(base, interval), interval);
         target <= identity.floor; target = nextBackupFloor(target, interval)) {
         segments.push(target);
@@ -543,6 +625,57 @@ function baselineFloor(identity, s = settings()) {
         return alignedFloor(identity.floor, interval);
     }
     return Math.min(identity.floor, Number(counter.lastFloor ?? 0));
+}
+
+function getProgressInfo(identity, s = settings()) {
+    const interval = intervalValue(s);
+    const counter = peekCounter(identity.key);
+    const isUnseen = !counter._exists && !counter.lastFloor && !counter.exports && !counter.lastExportAt;
+
+    if (s.countMode === 'ai') {
+        const messages = Array.isArray(ctx().chat) ? ctx().chat : [];
+        const aiMap = buildAiFloorMap(messages, Number(s.floorOffset) || 0);
+        const current = aiMap.totalTurns;
+        const base = isUnseen
+            ? alignedFloor(current, interval)
+            : Math.min(current, aiMap.floorToTurn(Number(counter.lastFloor ?? 0)));
+        const nextTarget = nextBackupFloor(base, interval);
+        const span = Math.max(1, nextTarget - base);
+        const remain = Math.max(0, nextTarget - current);
+        const progressed = Math.max(0, Math.min(span, current - base));
+        const pct = Math.round(progressed / span * 100);
+        return {
+            mode: 'ai',
+            current,
+            base,
+            nextTarget,
+            span,
+            remain,
+            progressed,
+            pct,
+            unitLabel: '轮',
+            baseFloorDisplay: aiMap.turnToFloor[base] ?? 0,
+        };
+    }
+
+    const base = baselineFloor(identity, s);
+    const nextTarget = nextBackupFloor(base, interval);
+    const span = Math.max(1, nextTarget - base);
+    const remain = Math.max(0, nextTarget - identity.floor);
+    const progressed = Math.max(0, Math.min(span, identity.floor - base));
+    const pct = Math.round(progressed / span * 100);
+    return {
+        mode: 'all',
+        current: identity.floor,
+        base,
+        nextTarget,
+        span,
+        remain,
+        progressed,
+        pct,
+        unitLabel: '楼',
+        baseFloorDisplay: base,
+    };
 }
 
 /* ------------------------------------------------------------------ *
@@ -873,7 +1006,7 @@ async function trimRollingBackups(root, limit, chat = null) {
     }
 }
 
-async function recordBackupWrite(root, segments, fileHandle, { chat, floor, interval }, isRewrite) {
+async function recordBackupWrite(root, segments, fileHandle, { chat, floor, interval, countUnit }, isRewrite) {
     const name = fileHandle.name;
     const path = JSON.stringify([...segments, name]).normalize('NFC').toLowerCase();
     const matches = await rollingRecords('path', path);
@@ -882,7 +1015,8 @@ async function recordBackupWrite(root, segments, fileHandle, { chat, floor, inte
         if (await root.isSameEntry(row.root) && await fileHandle.isSameEntry(row.handle)) old.push(row);
     }
     const previous = old.find(row => row.chat === chat);
-    const rolling = interval < PERMANENT_INTERVAL && floor % PERMANENT_INTERVAL !== 0;
+    const unit = Number.isFinite(countUnit) ? countUnit : floor;
+    const rolling = interval < PERMANENT_INTERVAL && unit % PERMANENT_INTERVAL !== 0;
     let record = null;
     if (isRewrite ? previous : rolling) {
         const file = await fileHandle.getFile();
@@ -986,6 +1120,7 @@ function cancelPendingRewrite() {
 async function runBackup({
     manual = false,
     targetFloor = null,
+    countUnit = null,
     overwriteFile = null,
     targetSegments = null,
     formatOverride = null,
@@ -1010,8 +1145,13 @@ async function runBackup({
         const segments = Array.isArray(targetSegments) ? targetSegments : backupPathSegments(identity);
         const isRewrite = Boolean(overwriteFile);
         const messages = Array.isArray(ctx().chat) ? ctx().chat : [];
-        const watchIndex = resolveWatchIndex(messages, backupFloor, Number(s.floorOffset) || 0);
+        const offset = Number(s.floorOffset) || 0;
+        const watchIndex = resolveWatchIndex(messages, backupFloor, offset);
         const watchFp = watchIndex >= 0 ? messageFingerprint(messages[watchIndex]) : '';
+        let resolvedCountUnit = Number.isFinite(countUnit) ? countUnit : undefined;
+        if (resolvedCountUnit === undefined && s.countMode === 'ai') {
+            resolvedCountUnit = buildAiFloorMap(messages, offset).floorToTurn(backupFloor);
+        }
 
         const { content, source } = await buildExportContent(format, {
             uptoFloor: targetFloor,
@@ -1028,6 +1168,7 @@ async function runBackup({
                     savedAs = await writeViaFsa(handle, segments, dirFileName, content, {
                         overwriteExact: isRewrite,
                         chat: identity.key, floor: backupFloor, interval,
+                        countUnit: resolvedCountUnit,
                     });
                     mode = 'fsa';
                 } catch (e) {
@@ -1055,10 +1196,20 @@ async function runBackup({
             counter.lastFloor = backupFloor;
             counter.exports = (counter.exports || 0) + 1;
             if (!manual) {
-                const aligned = alignedFloor(backupFloor, interval);
-                const base = Number(counter.backfilledFloor ?? 0);
-                if (aligned > base && nextBackupFloor(alignedFloor(base, interval), interval) === aligned) {
-                    counter.backfilledFloor = aligned;
+                if (s.countMode === 'ai') {
+                    const aiMap = buildAiFloorMap(messages, offset);
+                    const backupTurn = Number.isFinite(resolvedCountUnit) ? resolvedCountUnit : aiMap.floorToTurn(backupFloor);
+                    const alignedTurn = alignedFloor(backupTurn, interval);
+                    const baseTurn = aiMap.floorToTurn(Number(counter.backfilledFloor ?? 0));
+                    if (alignedTurn > baseTurn && nextBackupFloor(alignedFloor(baseTurn, interval), interval) === alignedTurn) {
+                        counter.backfilledFloor = aiMap.turnToFloor[alignedTurn] ?? backupFloor;
+                    }
+                } else {
+                    const aligned = alignedFloor(backupFloor, interval);
+                    const base = Number(counter.backfilledFloor ?? 0);
+                    if (aligned > base && nextBackupFloor(alignedFloor(base, interval), interval) === aligned) {
+                        counter.backfilledFloor = aligned;
+                    }
                 }
             }
         }
@@ -1227,6 +1378,9 @@ async function runBackfill() {
     const pathSegments = backupPathSegments(identity);
     const offset = Number(s.floorOffset) || 0;
     const swallowCap = Math.max(0, Math.min(50, Number(s.swallowHidden) || 0));
+    const initAll = Array.isArray(ctx().chat) ? ctx().chat : [];
+    let aiMapCache = s.countMode === 'ai' ? buildAiFloorMap(initAll, offset) : null;
+    let aiMapLen = initAll.length;
 
     let handle = null;
     let dirHandle = null;
@@ -1323,9 +1477,18 @@ async function runBackfill() {
                 let savedAs;
                 if (handle && dirHandle) {
                     try {
+                        let countUnit;
+                        if (s.countMode === 'ai') {
+                            if (!aiMapCache || aiMapLen !== all.length) {
+                                aiMapCache = buildAiFloorMap(all, offset);
+                                aiMapLen = all.length;
+                            }
+                            countUnit = aiMapCache.floorToTurn(target);
+                        }
                         savedAs = await writeViaFsa(handle, pathSegments, dirName, blob, {
                             dirHandle,
                             chat: identity.key, floor: target, interval,
+                            countUnit,
                             skipPermissionCheck: true,
                         });
                     } catch (e) {
@@ -1386,9 +1549,16 @@ async function runBackfill() {
 
 /** 把历史空档标记为已备份（不生成文件） */
 function markBackfilled(identity) {
+    const s = settings();
     const counter = getCounter(identity.key);
-    const interval = intervalValue();
-    counter.backfilledFloor = alignedFloor(identity.floor, interval);
+    const interval = intervalValue(s);
+    if (s.countMode === 'ai') {
+        const aiMap = buildAiFloorMap(ctx().chat, Number(s.floorOffset) || 0);
+        const alignedTurn = alignedFloor(aiMap.totalTurns, interval);
+        counter.backfilledFloor = aiMap.turnToFloor[alignedTurn] ?? 0;
+    } else {
+        counter.backfilledFloor = alignedFloor(identity.floor, interval);
+    }
     counter.name = identity.cardName;
     saveSettings();
     scheduleRefresh({ force: true });
@@ -1492,20 +1662,45 @@ async function onChatActivity(trigger, eventArg = null) {
                 scheduleRefresh();
                 return;
             }
-            log(`触发自动备份 key=${identity.key} floor=${identity.floor} interval=${s.interval}`);
+            log(`触发自动备份 key=${identity.key} floor=${identity.floor} interval=${s.interval} mode=${s.countMode}`);
             const interval = intervalValue(s);
+            if (s.countMode === 'ai') {
+                const aiMap = buildAiFloorMap(messages, offset);
+                if (interval >= PERMANENT_INTERVAL) {
+                    await runBackup({ countUnit: aiMap.totalTurns });
+                    return;
+                }
+                const counter = getCounter(identity.key);
+                const startTurn = aiMap.floorToTurn(counter.lastFloor);
+                for (let turn = nextBackupFloor(startTurn, interval);
+                    turn <= aiMap.totalTurns; turn = nextBackupFloor(turn, interval)) {
+                    // 仅 AI 模式下，普通节点等本次有效事件再导出，跨过的每 10 轮永久档仍须单独保存。
+                    if (turn < aiMap.totalTurns && turn % PERMANENT_INTERVAL !== 0) {
+                        turn = Math.min(aiMap.totalTurns, turn - turn % PERMANENT_INTERVAL + PERMANENT_INTERVAL);
+                    }
+                    const floor = aiMap.turnToFloor[turn];
+                    if (floor === undefined) break;
+                    const live = currentIdentity(false);
+                    if (live.key !== identity.key || live.floor < floor || !s.enabled || intervalValue(s) !== interval) break;
+                    if (floor <= counter.lastFloor) continue;
+                    if (s.skipEmptyReply && isMessageEmpty(messages[resolveWatchIndex(messages, floor, offset)])) continue;
+                    const result = await runBackup({
+                        targetFloor: floor === live.floor ? null : floor,
+                        countUnit: turn,
+                    });
+                    if (!result.ok) break;
+                }
+                return;
+            }
+
             if (interval >= PERMANENT_INTERVAL) {
                 await runBackup();
                 return;
             }
-            // 一次事件可能跨过多个节点（例如仅 AI 触发），逐个按实际楼号切片。
+            // 一次事件可能跨过多个节点，逐个按实际楼号切片。
             const counter = getCounter(identity.key);
             for (let floor = nextBackupFloor(counter.lastFloor, interval);
                 floor <= identity.floor; floor = nextBackupFloor(floor, interval)) {
-                // 仅 AI 模式下，普通节点等本次有效事件再导出，跨过的整十楼仍须单独保存。
-                if (s.countMode === 'ai' && floor < identity.floor && floor % PERMANENT_INTERVAL !== 0) {
-                    floor = Math.min(identity.floor, floor - floor % PERMANENT_INTERVAL + PERMANENT_INTERVAL);
-                }
                 const live = currentIdentity(false);
                 if (live.key !== identity.key || live.floor < floor || !s.enabled || intervalValue(s) !== interval) break;
                 if (floor <= counter.lastFloor) continue;
@@ -1731,7 +1926,7 @@ function buildSettingsRuleCard(s) {
     intervalWrap.append(intervalRow, presets);
     card.append(intervalWrap, el('div', 'cab-divider'));
 
-    const rolling = makeField('普通备份保留上限', '间隔为 1～9 楼时，每个整十楼永久保存。每个聊天在授权目录内只保留最近的指定份数，超出时先删最早的普通备份。浏览器下载的文件需手动清理。');
+    const rolling = makeField('普通备份保留上限', '间隔 1～9 时触发滚动保留（全部模式每整十楼永久保存；仅 AI 模式每 10 轮 AI 回复永久保存）。每个聊天在授权目录内只保留最近指定份数，超出时先删最早的普通备份；历史旧文件与下载文件不受影响。');
     const limitGroup = el('div', 'cab-input-group');
     const limitInput = document.createElement('input');
     limitInput.id = 'cab_rolling_limit';
@@ -1788,7 +1983,7 @@ function buildSettingsRuleCard(s) {
     card.append(srcField.field, el('div', 'cab-divider'));
 
     // 计数方式
-    const cnt = makeField('计数方式', '全部楼层：用户与 AI 各算一楼；仅 AI：一轮算一楼');
+    const cnt = makeField('计数方式', '全部楼层：用户与 AI 各算 1 楼；仅 AI：1 轮 AI 回复算 1 次（仍以界面楼号命名）');
     cnt.field.append(makeSegment('cab_count_seg', [
         ['all', '全部楼层'],
         ['ai', '仅 AI 楼层'],
@@ -2504,12 +2699,7 @@ function renderOverview(s, identity, pending) {
 
     const counter = peekCounter(identity.key);
     const interval = intervalValue(s);
-    const base = baselineFloor(identity, s);
-    const nextTarget = nextBackupFloor(base, interval);
-    const span = nextTarget - base;
-    const remain = Math.max(0, nextTarget - identity.floor);
-    const progressed = Math.max(0, Math.min(span, identity.floor - base));
-    const pct = Math.round(progressed / span * 100);
+    const prog = getProgressInfo(identity, s);
     const session = formatChatSession(identity.chatId, identity.cardName);
     const lastTime = formatReadableTime(counter.lastExportAt);
     const format = s.format === 'txt' ? 'txt' : 'jsonl';
@@ -2556,8 +2746,8 @@ function renderOverview(s, identity, pending) {
     if (s.enabled) {
         if (isDeferred) nextText = '空回已延后（等待重生成）';
         else if (isRewritePending) nextText = '检测到重写 · 即将更新';
-        else if (remain === 0) nextText = '即将自动导出';
-        else nextText = `距下次还差 ${remain} 楼`;
+        else if (prog.remain === 0) nextText = '即将自动导出';
+        else nextText = `距下次还差 ${prog.remain} ${prog.unitLabel}`;
     }
     const nextPill = el(
         'span',
@@ -2569,14 +2759,17 @@ function renderOverview(s, identity, pending) {
 
     const track = el('div', 'cab-progress-track');
     const fill = el('div', 'cab-progress-fill');
-    fill.style.width = `${pct}%`;
+    fill.style.width = `${prog.pct}%`;
     track.append(fill);
 
     const foot = el('div', 'cab-progress-foot');
-    foot.append(
-        el('span', '', `上次基线 #${base}`),
-        el('span', '', `目标 #${nextTarget}（${progressed}/${span}）`),
-    );
+    const footLeft = prog.mode === 'ai'
+        ? `已聊 ${prog.current} 轮 · 基线第 ${prog.base} 轮 (#${prog.baseFloorDisplay})`
+        : `上次基线 #${prog.base}`;
+    const footRight = prog.mode === 'ai'
+        ? `目标第 ${prog.nextTarget} 轮（${prog.progressed}/${prog.span}）`
+        : `目标 #${prog.nextTarget}（${prog.progressed}/${prog.span}）`;
+    foot.append(el('span', '', footLeft), el('span', '', footRight));
     progBlock.append(floorRow, track, foot);
     card.append(progBlock);
 
@@ -2985,4 +3178,6 @@ window.chatAutoBackup = {
     onChatActivity,
     isMessageEmpty,
     messageFingerprint,
+    buildAiFloorMap,
+    getProgressInfo,
 };
